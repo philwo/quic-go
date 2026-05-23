@@ -59,6 +59,22 @@ type cubicSender struct {
 
 	lastState qlog.CongestionState
 	qlogger   qlogwriter.Recorder
+
+	// preCutback is the cwnd state captured immediately before the most
+	// recent loss-driven cutback. Used to undo the cutback if the packet
+	// that triggered it is later detected as spurious (i.e. the "lost"
+	// packet was actually delivered, just reordered past our threshold).
+	// nil once consumed or once a fresh cutback happens for a higher PN.
+	preCutback *cwndSnapshot
+}
+
+// cwndSnapshot is a saved cubicSender state, used for spurious-loss undo.
+type cwndSnapshot struct {
+	congestionWindow           protocol.ByteCount
+	slowStartThreshold         protocol.ByteCount
+	largestSentAtLastCutback   protocol.PacketNumber
+	lastCutbackExitedSlowstart bool
+	cubic                      Cubic
 }
 
 var (
@@ -205,6 +221,16 @@ func (c *cubicSender) OnCongestionEvent(packetNumber protocol.PacketNumber, lost
 	if packetNumber <= c.largestSentAtLastCutback {
 		return
 	}
+	// Snapshot pre-cut state for possible spurious-loss undo. A fresh cutback
+	// supersedes any older snapshot — once we cut again, the prior cut's
+	// "what would things look like if we hadn't cut" is no longer reachable.
+	c.preCutback = &cwndSnapshot{
+		congestionWindow:           c.congestionWindow,
+		slowStartThreshold:         c.slowStartThreshold,
+		largestSentAtLastCutback:   c.largestSentAtLastCutback,
+		lastCutbackExitedSlowstart: c.lastCutbackExitedSlowstart,
+		cubic:                      *c.cubic,
+	}
 	c.lastCutbackExitedSlowstart = c.InSlowStart()
 	c.maybeQlogStateChange(qlog.CongestionStateRecovery)
 
@@ -221,6 +247,36 @@ func (c *cubicSender) OnCongestionEvent(packetNumber protocol.PacketNumber, lost
 	// reset packet count from congestion avoidance mode. We start
 	// counting again when we're out of recovery.
 	c.numAckedPackets = 0
+}
+
+// OnSpuriousLoss undoes the cwnd reduction taken on the previous
+// OnCongestionEvent for packetNumber, if (a) we still have a snapshot from
+// that event and (b) the packet was lost during the current cutback's
+// epoch. Once consumed, the snapshot is cleared.
+func (c *cubicSender) OnSpuriousLoss(packetNumber protocol.PacketNumber) {
+	s := c.preCutback
+	if s == nil {
+		return
+	}
+	// The current epoch covers (preCutback.largestSentAtLastCutback,
+	// c.largestSentAtLastCutback]. A spurious packet outside that range
+	// belongs to some earlier cut whose snapshot is gone, so can't be
+	// used to undo the current cut.
+	if packetNumber <= s.largestSentAtLastCutback {
+		return
+	}
+	c.congestionWindow = s.congestionWindow
+	c.slowStartThreshold = s.slowStartThreshold
+	c.largestSentAtLastCutback = s.largestSentAtLastCutback
+	c.lastCutbackExitedSlowstart = s.lastCutbackExitedSlowstart
+	*c.cubic = s.cubic
+	c.preCutback = nil
+	c.numAckedPackets = 0
+	if c.InSlowStart() {
+		c.maybeQlogStateChange(qlog.CongestionStateSlowStart)
+	} else {
+		c.maybeQlogStateChange(qlog.CongestionStateCongestionAvoidance)
+	}
 }
 
 // Called when we receive an ack. Normal TCP tracks how many packets one ack

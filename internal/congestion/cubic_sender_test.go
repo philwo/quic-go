@@ -221,6 +221,86 @@ func TestCubicSenderSlowStartPacketLoss(t *testing.T) {
 	require.False(t, sender.sender.hybridSlowStart.Started())
 }
 
+// TestCubicSenderSpuriousLossUndo verifies that a cwnd cutback is rolled back
+// when the packet that triggered it is later detected as spurious.
+func TestCubicSenderSpuriousLossUndo(t *testing.T) {
+	sender := newTestCubicSender(false)
+
+	// Build cwnd in slow start.
+	const numberOfAcks = 10
+	for range numberOfAcks {
+		sender.SendAvailableSendWindow()
+		sender.AckNPackets(2)
+	}
+	sender.SendAvailableSendWindow()
+	preCutWindow := defaultWindowTCP + (maxDatagramSize * 2 * numberOfAcks)
+	require.Equal(t, preCutWindow, sender.sender.GetCongestionWindow())
+
+	// Declare a packet lost.
+	losePN := sender.ackedPacketNumber + 1
+	sender.LosePacket(losePN)
+	require.Less(t, sender.sender.GetCongestionWindow(), preCutWindow,
+		"cwnd should have shrunk after loss")
+	require.True(t, sender.sender.InRecovery())
+
+	// Later we discover the loss was spurious. The undo should restore cwnd.
+	sender.sender.OnSpuriousLoss(losePN)
+	require.Equal(t, preCutWindow, sender.sender.GetCongestionWindow(),
+		"cwnd should be restored to pre-cut value")
+	require.False(t, sender.sender.InRecovery(),
+		"undo should also exit recovery state")
+
+	// A second spurious-loss notification for the same epoch is a no-op
+	// (the snapshot has been consumed).
+	sender.sender.OnSpuriousLoss(losePN)
+	require.Equal(t, preCutWindow, sender.sender.GetCongestionWindow())
+
+	// A real loss after undo cuts again, from the restored cwnd.
+	losePN2 := sender.ackedPacketNumber + 2
+	sender.LosePacket(losePN2)
+	require.Less(t, sender.sender.GetCongestionWindow(), preCutWindow,
+		"a fresh real loss after undo should still cut")
+}
+
+// TestCubicSenderSpuriousLossStaleEpoch verifies that a spurious-loss
+// notification for a packet older than the current cutback epoch does NOT
+// undo — that snapshot is gone, and undoing the wrong cut would corrupt state.
+func TestCubicSenderSpuriousLossStaleEpoch(t *testing.T) {
+	sender := newTestCubicSender(false)
+
+	const numberOfAcks = 10
+	for range numberOfAcks {
+		sender.SendAvailableSendWindow()
+		sender.AckNPackets(2)
+	}
+	sender.SendAvailableSendWindow()
+	largeWindow := defaultWindowTCP + (maxDatagramSize * 2 * numberOfAcks)
+	require.Equal(t, largeWindow, sender.sender.GetCongestionWindow())
+
+	// First loss event, on some early PN.
+	oldLossPN := sender.ackedPacketNumber + 1
+	sender.LosePacket(oldLossPN)
+	afterFirstCut := sender.sender.GetCongestionWindow()
+	require.Less(t, afterFirstCut, largeWindow)
+
+	// Recover from first cut, advance past it.
+	for range 5 {
+		sender.AckNPackets(2)
+	}
+	sender.SendAvailableSendWindow()
+
+	// Second (real) loss event with a much higher PN — replaces the snapshot.
+	newLossPN := sender.packetNumber - 1
+	sender.LosePacket(newLossPN)
+	afterSecondCut := sender.sender.GetCongestionWindow()
+
+	// Now report the OLD loss as spurious. It belongs to a pre-current
+	// epoch, so the current cut must NOT be undone.
+	sender.sender.OnSpuriousLoss(oldLossPN)
+	require.Equal(t, afterSecondCut, sender.sender.GetCongestionWindow(),
+		"undo for stale epoch must not restore")
+}
+
 func TestCubicSenderSlowStartPacketLossPRR(t *testing.T) {
 	sender := newTestCubicSender(false)
 
