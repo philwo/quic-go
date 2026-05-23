@@ -14,6 +14,12 @@ type SendAlgorithm interface {
 	MaybeExitSlowStart()
 	OnPacketAcked(number protocol.PacketNumber, ackedBytes protocol.ByteCount, priorInFlight protocol.ByteCount, eventTime monotime.Time)
 	OnCongestionEvent(number protocol.PacketNumber, lostBytes protocol.ByteCount, priorInFlight protocol.ByteCount)
+	// OnSpuriousLoss is called when a packet previously reported lost via
+	// OnCongestionEvent turns out to have been delivered (it was ACKed
+	// later than the loss detector's threshold allowed for). Implementations
+	// should consider undoing the cwnd reduction taken at the time of the
+	// original "loss," if it can be attributed to this packet's epoch.
+	OnSpuriousLoss(number protocol.PacketNumber)
 	OnRetransmissionTimeout(packetsRetransmitted bool)
 	SetMaxDatagramSize(protocol.ByteCount)
 }

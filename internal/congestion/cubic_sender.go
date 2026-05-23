@@ -59,6 +59,30 @@ type cubicSender struct {
 
 	lastState qlog.CongestionState
 	qlogger   qlogwriter.Recorder
+
+	// preCutback is the cwnd state captured immediately before the most
+	// recent loss-driven cutback. Used to undo the cutback if every
+	// declared loss in the cutback's epoch is later detected as spurious.
+	// nil once consumed or once a fresh cutback happens for a higher PN.
+	preCutback *cwndSnapshot
+
+	// lossesInEpoch counts the OnCongestionEvent calls within the current
+	// cutback's epoch (the first call cuts cwnd; subsequent calls in the
+	// same epoch are folded into a single loss event but still bump this
+	// counter). OnSpuriousLoss decrements it; the undo only fires when it
+	// reaches zero — i.e. every declared loss in the epoch was disproven.
+	// This guards against undoing a cut where some sibling loss was real,
+	// even when the trigger packet itself turns out to have been ACKed.
+	lossesInEpoch int
+}
+
+// cwndSnapshot is a saved cubicSender state, used for spurious-loss undo.
+type cwndSnapshot struct {
+	congestionWindow           protocol.ByteCount
+	slowStartThreshold         protocol.ByteCount
+	largestSentAtLastCutback   protocol.PacketNumber
+	lastCutbackExitedSlowstart bool
+	cubic                      Cubic
 }
 
 var (
@@ -203,8 +227,25 @@ func (c *cubicSender) OnCongestionEvent(packetNumber protocol.PacketNumber, lost
 	// TCP NewReno (RFC6582) says that once a loss occurs, any losses in packets
 	// already sent should be treated as a single loss event, since it's expected.
 	if packetNumber <= c.largestSentAtLastCutback {
+		// Same loss epoch — no further cut, but track this loss for the
+		// spurious-loss undo counter so we don't wrongly undo when only
+		// the trigger turns out to be spurious while a sibling was real.
+		if c.preCutback != nil {
+			c.lossesInEpoch++
+		}
 		return
 	}
+	// Snapshot pre-cut state for possible spurious-loss undo. A fresh cutback
+	// supersedes any older snapshot — once we cut again, the prior cut's
+	// "what would things look like if we hadn't cut" is no longer reachable.
+	c.preCutback = &cwndSnapshot{
+		congestionWindow:           c.congestionWindow,
+		slowStartThreshold:         c.slowStartThreshold,
+		largestSentAtLastCutback:   c.largestSentAtLastCutback,
+		lastCutbackExitedSlowstart: c.lastCutbackExitedSlowstart,
+		cubic:                      *c.cubic,
+	}
+	c.lossesInEpoch = 1
 	c.lastCutbackExitedSlowstart = c.InSlowStart()
 	c.maybeQlogStateChange(qlog.CongestionStateRecovery)
 
@@ -221,6 +262,45 @@ func (c *cubicSender) OnCongestionEvent(packetNumber protocol.PacketNumber, lost
 	// reset packet count from congestion avoidance mode. We start
 	// counting again when we're out of recovery.
 	c.numAckedPackets = 0
+}
+
+// OnSpuriousLoss undoes the cwnd reduction taken on the previous
+// OnCongestionEvent only when *every* declared loss in the current cutback's
+// epoch has been confirmed spurious. This avoids erasing a real congestion
+// response when only some packets in the epoch were reordering false-
+// positives and a sibling was a genuine loss.
+func (c *cubicSender) OnSpuriousLoss(packetNumber protocol.PacketNumber) {
+	s := c.preCutback
+	if s == nil {
+		return
+	}
+	// The current epoch covers (preCutback.largestSentAtLastCutback,
+	// c.largestSentAtLastCutback]. A spurious packet outside that range
+	// belongs to some earlier cut whose snapshot is gone, so can't be
+	// used to undo the current cut.
+	if packetNumber <= s.largestSentAtLastCutback {
+		return
+	}
+	if c.lossesInEpoch > 0 {
+		c.lossesInEpoch--
+	}
+	if c.lossesInEpoch > 0 {
+		// Other losses in this epoch are still unresolved. If any of
+		// them is genuine, the cut was deserved — wait for confirmation.
+		return
+	}
+	c.congestionWindow = s.congestionWindow
+	c.slowStartThreshold = s.slowStartThreshold
+	c.largestSentAtLastCutback = s.largestSentAtLastCutback
+	c.lastCutbackExitedSlowstart = s.lastCutbackExitedSlowstart
+	*c.cubic = s.cubic
+	c.preCutback = nil
+	c.numAckedPackets = 0
+	if c.InSlowStart() {
+		c.maybeQlogStateChange(qlog.CongestionStateSlowStart)
+	} else {
+		c.maybeQlogStateChange(qlog.CongestionStateCongestionAvoidance)
+	}
 }
 
 // Called when we receive an ack. Normal TCP tracks how many packets one ack

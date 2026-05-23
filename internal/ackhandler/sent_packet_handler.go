@@ -519,6 +519,10 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 	}
 	for _, pn := range spuriousLosses {
 		h.lostPackets.Delete(pn)
+		// Tell the congestion controller this loss was bogus so it can
+		// undo the cwnd reduction it took at the time of the original
+		// (incorrect) loss declaration.
+		h.congestion.OnSpuriousLoss(pn)
 	}
 }
 
