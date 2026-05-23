@@ -322,8 +322,9 @@ func (c *cubicSender) maybeIncreaseCwnd(
 		return
 	}
 	if c.InSlowStart() {
-		// TCP slow start, exponential growth, increase by one for each ACK.
-		c.congestionWindow += c.maxDatagramSize
+		// Slow start (or HyStart++ CSS): increase cwnd by one MSS per ACK
+		// in regular SS, by one MSS / CSS_GROWTH_DIVISOR in CSS.
+		c.congestionWindow += c.maxDatagramSize / protocol.ByteCount(c.hybridSlowStart.GrowthDivisor())
 		c.maybeQlogStateChange(qlog.CongestionStateSlowStart)
 		return
 	}
