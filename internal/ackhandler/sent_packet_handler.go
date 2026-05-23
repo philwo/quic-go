@@ -16,11 +16,13 @@ import (
 )
 
 const (
-	// Maximum reordering in time space before time based loss detection considers a packet lost.
-	// Specified as an RTT multiplier.
-	timeThreshold = 9.0 / 8
-	// Maximum reordering in packets before packet threshold loss detection considers a packet lost.
-	packetThreshold = 3
+	// RFC 9002 kTimeThreshold: max reordering in time before time-based loss
+	// detection considers a packet lost, as an RTT multiplier. Recommended 9/8.
+	defaultTimeThreshold = 9.0 / 8
+	// RFC 9002 kPacketThreshold: max reordering in packets before packet-
+	// threshold loss detection considers a packet lost. Recommended 3; MUST
+	// NOT be less than 3.
+	defaultPacketThreshold = 3
 	// Before validating the client's address, the server won't send more than 3x bytes than it received.
 	amplificationFactor = 3
 	// We use Retry packets to derive an RTT estimate. Make sure we don't set the RTT to a super low value yet.
@@ -108,6 +110,10 @@ type sentPacketHandler struct {
 
 	perspective protocol.Perspective
 
+	// Loss detection thresholds (RFC 9002). See default constants above.
+	packetThreshold int
+	timeThreshold   float64
+
 	qlogger     qlogwriter.Recorder
 	lastMetrics qlog.MetricsUpdated
 	logger      utils.Logger
@@ -128,6 +134,8 @@ func NewSentPacketHandler(
 	pers protocol.Perspective,
 	qlogger qlogwriter.Recorder,
 	logger utils.Logger,
+	packetThreshold int,
+	timeThreshold float64,
 ) SentPacketHandler {
 	congestion := congestion.NewCubicSender(
 		congestion.DefaultClock{},
@@ -137,6 +145,13 @@ func NewSentPacketHandler(
 		true, // use Reno
 		qlogger,
 	)
+
+	if packetThreshold <= 0 {
+		packetThreshold = defaultPacketThreshold
+	}
+	if timeThreshold <= 0 {
+		timeThreshold = defaultTimeThreshold
+	}
 
 	h := &sentPacketHandler{
 		peerCompletedAddressValidation: pers == protocol.PerspectiveServer,
@@ -150,6 +165,8 @@ func NewSentPacketHandler(
 		congestion:                     congestion,
 		ignorePacketsBelow:             ignorePacketsBelow,
 		perspective:                    pers,
+		packetThreshold:                packetThreshold,
+		timeThreshold:                  timeThreshold,
 		qlogger:                        qlogger,
 		logger:                         logger,
 	}
@@ -793,7 +810,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 	pnSpace.lossTime = 0
 
 	maxRTT := float64(max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT()))
-	lossDelay := time.Duration(timeThreshold * maxRTT)
+	lossDelay := time.Duration(h.timeThreshold * maxRTT)
 
 	// Minimum time of granularity before packets are deemed lost.
 	lossDelay = max(lossDelay, protocol.TimerGranularity)
@@ -824,7 +841,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 					})
 				}
 			}
-		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= packetThreshold {
+		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= protocol.PacketNumber(h.packetThreshold) {
 			packetLost = true
 			if !p.isPathProbePacket && p.IsAckEliciting() {
 				if h.logger.Debug() {

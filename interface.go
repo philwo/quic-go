@@ -157,6 +157,20 @@ type Config struct {
 	// If set to 0, then no keep alive is sent. Otherwise, the keep alive is sent on that period (or at most
 	// every half of MaxIdleTimeout, whichever is smaller).
 	KeepAlivePeriod time.Duration
+	// LossDetectionPacketThreshold overrides RFC 9002's kPacketThreshold
+	// (the maximum reordering, in packets, before packet-threshold loss
+	// detection declares a packet lost). Defaults to 3. RFC 9002 forbids
+	// values less than 3. Raising this is useful on paths with bounded but
+	// significant packet reordering (e.g. v4-in-v6 ISP tunnels, ECMP fan-
+	// outs) to avoid spurious loss declarations; the time-based detector
+	// still bounds the worst-case detection delay.
+	LossDetectionPacketThreshold int
+	// LossDetectionTimeThreshold overrides RFC 9002's kTimeThreshold (the
+	// max reordering in time, as a multiplier of max(SRTT, latestRTT),
+	// before time-based loss detection declares a packet lost). Defaults
+	// to 9/8 (= 1.125). Raising this trades faster loss recovery for
+	// fewer spurious declarations on reordering-prone paths.
+	LossDetectionTimeThreshold float64
 	// InitialPacketSize is the initial size (and the lower limit) for packets sent.
 	// Under most circumstances, it is not necessary to manually set this value,
 	// since path MTU discovery quickly finds the path's MTU.
