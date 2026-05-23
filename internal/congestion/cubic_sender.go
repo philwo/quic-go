@@ -232,7 +232,16 @@ func (c *cubicSender) OnPacketAcked(
 	}
 	c.maybeIncreaseCwnd(ackedPacketNumber, ackedBytes, priorInFlight, eventTime)
 	if c.InSlowStart() {
-		c.hybridSlowStart.OnPacketAcked(ackedPacketNumber)
+		// If hybridSlowStart's round-end completes CSS, exit slow start
+		// immediately: subsequent per-packet OnPacketAcked calls within
+		// this ReceivedAck (or in later reordered ACKs that don't update
+		// RTT and therefore don't trigger MaybeExitSlowStart) would
+		// otherwise still apply CSS-throttled growth past the CSS_ROUNDS
+		// budget.
+		if c.hybridSlowStart.OnPacketAcked(ackedPacketNumber) {
+			c.slowStartThreshold = c.congestionWindow
+			c.maybeQlogStateChange(qlog.CongestionStateCongestionAvoidance)
+		}
 	}
 }
 
@@ -406,8 +415,9 @@ func (c *cubicSender) maybeIncreaseCwnd(
 		return
 	}
 	if c.InSlowStart() {
-		// TCP slow start, exponential growth, increase by one for each ACK.
-		c.congestionWindow += c.maxDatagramSize
+		// Slow start (or HyStart++ CSS): increase cwnd by one MSS per ACK
+		// in regular SS, by one MSS / CSS_GROWTH_DIVISOR in CSS.
+		c.congestionWindow += c.maxDatagramSize / protocol.ByteCount(c.hybridSlowStart.GrowthDivisor())
 		c.maybeQlogStateChange(qlog.CongestionStateSlowStart)
 		return
 	}
