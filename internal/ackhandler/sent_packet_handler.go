@@ -3,6 +3,7 @@ package ackhandler
 import (
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/quic-go/quic-go/internal/congestion"
@@ -16,11 +17,13 @@ import (
 )
 
 const (
-	// Maximum reordering in time space before time based loss detection considers a packet lost.
-	// Specified as an RTT multiplier.
-	timeThreshold = 9.0 / 8
-	// Maximum reordering in packets before packet threshold loss detection considers a packet lost.
-	packetThreshold = 3
+	// RFC 9002 kTimeThreshold: max reordering in time before time-based loss
+	// detection considers a packet lost, as an RTT multiplier. Recommended 9/8.
+	defaultTimeThreshold = 9.0 / 8
+	// RFC 9002 kPacketThreshold: max reordering in packets before packet-
+	// threshold loss detection considers a packet lost. Recommended 3; MUST
+	// NOT be less than 3.
+	defaultPacketThreshold = 3
 	// Before validating the client's address, the server won't send more than 3x bytes than it received.
 	amplificationFactor = 3
 	// We use Retry packets to derive an RTT estimate. Make sure we don't set the RTT to a super low value yet.
@@ -108,6 +111,10 @@ type sentPacketHandler struct {
 
 	perspective protocol.Perspective
 
+	// Loss detection thresholds (RFC 9002). See default constants above.
+	packetThreshold int
+	timeThreshold   float64
+
 	qlogger     qlogwriter.Recorder
 	lastMetrics qlog.MetricsUpdated
 	logger      utils.Logger
@@ -128,6 +135,8 @@ func NewSentPacketHandler(
 	pers protocol.Perspective,
 	qlogger qlogwriter.Recorder,
 	logger utils.Logger,
+	packetThreshold int,
+	timeThreshold float64,
 ) SentPacketHandler {
 	congestion := congestion.NewCubicSender(
 		congestion.DefaultClock{},
@@ -137,6 +146,25 @@ func NewSentPacketHandler(
 		true, // use Reno
 		qlogger,
 	)
+
+	// RFC 9002 §6.1.1 forbids a packet threshold below 3, so silently clamp
+	// any below-minimum override (including the zero/"unset" value) up to the
+	// default. Without this, a caller could request a 1- or 2-packet gap and
+	// drive non-compliant, overly-aggressive loss detection.
+	if packetThreshold < defaultPacketThreshold {
+		packetThreshold = defaultPacketThreshold
+	}
+	// Reject non-finite (NaN, ±Inf) and non-positive time thresholds in
+	// addition to the zero/"unset" case. NaN and +Inf would survive the
+	// "<= 0" check (all comparisons with NaN are false, and +Inf is not
+	// <= 0), then poison the timeThreshold * maxRTT product in
+	// detectLostPackets; converting that to time.Duration is implementation-
+	// defined and on current Go yields math.MinInt64, which the subsequent
+	// max(..., TimerGranularity) silently turns into a 1-tick loss delay —
+	// the exact opposite of relaxed time-based loss detection.
+	if !(timeThreshold > 0) || math.IsInf(timeThreshold, 0) {
+		timeThreshold = defaultTimeThreshold
+	}
 
 	h := &sentPacketHandler{
 		peerCompletedAddressValidation: pers == protocol.PerspectiveServer,
@@ -150,6 +178,8 @@ func NewSentPacketHandler(
 		congestion:                     congestion,
 		ignorePacketsBelow:             ignorePacketsBelow,
 		perspective:                    pers,
+		packetThreshold:                packetThreshold,
+		timeThreshold:                  timeThreshold,
 		qlogger:                        qlogger,
 		logger:                         logger,
 	}
@@ -867,7 +897,32 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 	pnSpace.lossTime = 0
 
 	maxRTT := float64(max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT()))
-	lossDelay := time.Duration(timeThreshold * maxRTT)
+	// Clamp the product before the float→Duration conversion and before
+	// lossDelay participates in any monotime arithmetic. h.timeThreshold
+	// is guaranteed finite and positive by NewSentPacketHandler, but a
+	// pathologically large finite product (e.g. 1e15 threshold * 1s RTT
+	// = 1e24 ns) can break two separate operations downstream:
+	//   (1) The float→Duration conversion itself: Go's spec leaves the
+	//       out-of-range case implementation-defined, and the current
+	//       runtime yields math.MinInt64 — which max(..., TimerGranularity)
+	//       silently turns into a 1-tick loss delay.
+	//   (2) p.SendTime.Add(lossDelay) below: p.SendTime is a positive
+	//       monotime offset, so even a finite lossDelay near math.MaxInt64
+	//       would wrap that sum into the past, parking pnSpace.lossTime in
+	//       the past so the loss timer would fire immediately on every ACK.
+	// Cap at half of math.MaxInt64: comfortably permissive (≈ 146 years
+	// as a Duration, more than any practical loss-delay request), yet
+	// always safe for the Add as long as p.SendTime fits in the other
+	// half — true for any monotime offset from a process that hasn't been
+	// running for >146 years.
+	const maxLossDelay = time.Duration(math.MaxInt64 / 2)
+	lossDelayFloat := h.timeThreshold * maxRTT
+	var lossDelay time.Duration
+	if lossDelayFloat >= float64(maxLossDelay) {
+		lossDelay = maxLossDelay
+	} else {
+		lossDelay = time.Duration(lossDelayFloat)
+	}
 
 	// Minimum time of granularity before packets are deemed lost.
 	lossDelay = max(lossDelay, protocol.TimerGranularity)
@@ -898,7 +953,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 					})
 				}
 			}
-		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= packetThreshold {
+		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= protocol.PacketNumber(h.packetThreshold) {
 			packetLost = true
 			if !p.isPathProbePacket && p.IsAckEliciting() {
 				if h.logger.Debug() {

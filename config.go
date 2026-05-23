@@ -111,6 +111,8 @@ func populateConfig(config *Config) *Config {
 		HandshakeIdleTimeout:             handshakeIdleTimeout,
 		MaxIdleTimeout:                   idleTimeout,
 		KeepAlivePeriod:                  config.KeepAlivePeriod,
+		LossDetectionPacketThreshold:     config.LossDetectionPacketThreshold,
+		LossDetectionTimeThreshold:       config.LossDetectionTimeThreshold,
 		InitialStreamReceiveWindow:       initialStreamReceiveWindow,
 		MaxStreamReceiveWindow:           maxStreamReceiveWindow,
 		InitialConnectionReceiveWindow:   initialConnectionReceiveWindow,

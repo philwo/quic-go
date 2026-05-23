@@ -3,6 +3,7 @@ package ackhandler
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"testing"
@@ -119,6 +120,8 @@ func testSentPacketHandlerSendAndAcknowledge(t *testing.T, encLevel protocol.Enc
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 
 	var packets packetTracker
@@ -174,6 +177,8 @@ func TestSentPacketHandlerAcknowledgeSkippedPacket(t *testing.T) {
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 
 	now := monotime.Now()
@@ -217,6 +222,8 @@ func TestSentPacketHandlerRTTAckEliciting(t *testing.T) {
 		protocol.PerspectiveClient,
 		&eventRecorder,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 
 	getPacketsInFlight := func() int {
@@ -305,6 +312,8 @@ func TestSentPacketHandlerRTTAcrossPacketNumberSpaces(t *testing.T) {
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 
 	sendPacket := func(t *testing.T, ti monotime.Time, encLevel protocol.EncryptionLevel) protocol.PacketNumber {
@@ -366,6 +375,8 @@ func testSentPacketHandlerRTTAckDelays(t *testing.T, encLevel protocol.Encryptio
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 
 	sendPacket := func(t *testing.T, ti monotime.Time) protocol.PacketNumber {
@@ -457,6 +468,8 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
 		protocol.PerspectiveServer,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 
 	if addressValidated {
@@ -528,6 +541,8 @@ func testSentPacketHandlerAmplificationLimitClient(t *testing.T, dropHandshake b
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 
 	require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
@@ -584,6 +599,8 @@ func TestSentPacketHandlerDelayBasedLossDetection(t *testing.T) {
 		protocol.PerspectiveServer,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 
 	var packets packetTracker
@@ -639,6 +656,8 @@ func TestSentPacketHandlerPacketBasedLossDetection(t *testing.T) {
 		protocol.PerspectiveServer,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 
 	var packets packetTracker
@@ -701,6 +720,8 @@ func testSentPacketHandlerPTO(t *testing.T, encLevel protocol.EncryptionLevel, p
 		protocol.PerspectiveServer,
 		&eventRecorder,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 
 	// in the application-data packet number space, the PTO is only set
@@ -919,6 +940,8 @@ func TestSentPacketHandlerPacketNumberSpacesPTO(t *testing.T) {
 		protocol.PerspectiveServer,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 
 	sendPacket := func(t *testing.T, ti monotime.Time, encLevel protocol.EncryptionLevel) protocol.PacketNumber {
@@ -1012,6 +1035,8 @@ func TestSentPacketHandler0RTT(t *testing.T) {
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 
 	var appDataPackets packetTracker
@@ -1064,6 +1089,8 @@ func TestSentPacketHandlerCongestion(t *testing.T) {
 		protocol.PerspectiveServer,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 	sph.(*sentPacketHandler).congestion = cong
 
@@ -1165,6 +1192,8 @@ func testSentPacketHandlerRetry(t *testing.T, rtt, expectedRTT time.Duration) {
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 
 	start := monotime.Now()
@@ -1217,6 +1246,8 @@ func TestSentPacketHandlerRetryAfterPTO(t *testing.T) {
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 
 	var packets packetTracker
@@ -1262,6 +1293,8 @@ func TestSentPacketHandlerECN(t *testing.T) {
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 	sph.(*sentPacketHandler).ecnTracker = ecnHandler
 	sph.(*sentPacketHandler).congestion = cong
@@ -1373,6 +1406,8 @@ func TestSentPacketHandlerPathProbe(t *testing.T) {
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 	sph.DropPackets(protocol.EncryptionInitial, monotime.Now())
 	sph.DropPackets(protocol.EncryptionHandshake, monotime.Now())
@@ -1454,6 +1489,8 @@ func TestSentPacketHandlerPathProbeAckAndLoss(t *testing.T) {
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 	sph.DropPackets(protocol.EncryptionInitial, monotime.Now())
 	sph.DropPackets(protocol.EncryptionHandshake, monotime.Now())
@@ -1531,6 +1568,8 @@ func testSentPacketHandlerRandomized(t *testing.T, seed uint64) {
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 	sph.DropPackets(protocol.EncryptionInitial, monotime.Now())
 	sph.DropPackets(protocol.EncryptionHandshake, monotime.Now())
@@ -1601,6 +1640,8 @@ func TestSentPacketHandlerSpuriousLoss(t *testing.T) {
 		protocol.PerspectiveClient,
 		&eventRecorder,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 
 	var packets packetTracker
@@ -1712,6 +1753,182 @@ func TestSentPacketHandlerSpuriousLoss(t *testing.T) {
 
 // newMockedSPH wires a SentPacketHandler whose congestion controller is a
 // gomock mock, returning both the SPH and the mock.
+// TestSentPacketHandlerPacketThresholdClampedToMinimum verifies that
+// LossDetectionPacketThreshold values below RFC 9002 §6.1.1's minimum (3)
+// are silently clamped to the default, so a misconfigured caller can't drive
+// non-compliant, overly-aggressive loss detection.
+func TestSentPacketHandlerPacketThresholdClampedToMinimum(t *testing.T) {
+	for _, requested := range []int{-1, 0, 1, 2} {
+		t.Run(fmt.Sprintf("requested=%d", requested), func(t *testing.T) {
+			sph := NewSentPacketHandler(
+				0,
+				1200,
+				utils.NewRTTStats(),
+				&utils.ConnectionStats{},
+				true,
+				false,
+				nil,
+				protocol.PerspectiveClient,
+				nil,
+				utils.DefaultLogger,
+				requested,
+				0,
+			)
+			require.Equal(t, defaultPacketThreshold, sph.(*sentPacketHandler).packetThreshold,
+				"below-minimum packet threshold must be clamped to default")
+		})
+	}
+
+	// Values at or above the minimum must be honored as-is.
+	for _, requested := range []int{3, 5, 15, 100} {
+		t.Run(fmt.Sprintf("requested=%d", requested), func(t *testing.T) {
+			sph := NewSentPacketHandler(
+				0,
+				1200,
+				utils.NewRTTStats(),
+				&utils.ConnectionStats{},
+				true,
+				false,
+				nil,
+				protocol.PerspectiveClient,
+				nil,
+				utils.DefaultLogger,
+				requested,
+				0,
+			)
+			require.Equal(t, requested, sph.(*sentPacketHandler).packetThreshold,
+				"at-or-above-minimum packet threshold must be honored")
+		})
+	}
+}
+
+// TestSentPacketHandlerTimeThresholdRejectsNonFiniteOrNonPositive verifies
+// that LossDetectionTimeThreshold values that are non-positive (zero, the
+// "unset" value, or negative) or non-finite (NaN, ±Inf) fall back to the
+// RFC 9002 default. Without this guard, NaN and +Inf would survive the
+// "<= 0" check (all comparisons with NaN are false; +Inf is not <= 0) and
+// poison the timeThreshold*maxRTT product in detectLostPackets — silently
+// inverting the intended relaxation into a 1-tick loss delay.
+func TestSentPacketHandlerTimeThresholdRejectsNonFiniteOrNonPositive(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		requested float64
+	}{
+		{"unset (zero)", 0},
+		{"negative", -1.0},
+		{"NaN", math.NaN()},
+		{"PosInf", math.Inf(+1)},
+		{"NegInf", math.Inf(-1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sph := NewSentPacketHandler(
+				0,
+				1200,
+				utils.NewRTTStats(),
+				&utils.ConnectionStats{},
+				true,
+				false,
+				nil,
+				protocol.PerspectiveClient,
+				nil,
+				utils.DefaultLogger,
+				0,
+				tc.requested,
+			)
+			require.Equal(t, float64(defaultTimeThreshold), sph.(*sentPacketHandler).timeThreshold,
+				"non-positive or non-finite time threshold must fall back to default")
+		})
+	}
+
+	// Finite positive values must be honored as-is, including very large
+	// ones (the overflow guard sits at the use site, not at setup).
+	for _, requested := range []float64{0.5, 1.0, 9.0 / 8, 2.0, 10.0, 1e9} {
+		t.Run(fmt.Sprintf("requested=%g", requested), func(t *testing.T) {
+			sph := NewSentPacketHandler(
+				0,
+				1200,
+				utils.NewRTTStats(),
+				&utils.ConnectionStats{},
+				true,
+				false,
+				nil,
+				protocol.PerspectiveClient,
+				nil,
+				utils.DefaultLogger,
+				0,
+				requested,
+			)
+			require.Equal(t, requested, sph.(*sentPacketHandler).timeThreshold,
+				"finite positive time threshold must be honored as-is")
+		})
+	}
+}
+
+// TestSentPacketHandlerTimeThresholdNoOverflow verifies that detectLostPackets
+// caps lossDelay before BOTH the float→Duration conversion AND any monotime
+// arithmetic on it. A pathologically large finite product would otherwise
+// break two independent operations:
+//   (1) The float→Duration conversion itself: Go's implementation-defined
+//       overflow yields math.MinInt64, which max(..., TimerGranularity)
+//       silently turns into a 1-tick loss delay.
+//   (2) p.SendTime.Add(lossDelay): even a finite lossDelay near
+//       math.MaxInt64 wraps the sum past int64 into the past, parking
+//       pnSpace.lossTime in the past so the loss timer fires immediately
+//       on every ACK instead of deferring time-based loss detection.
+//
+// We assert (1) by checking that the older packet is NOT time-lost despite
+// being far older than a 1-tick lossDelay would imply, and (2) by checking
+// that the loss-detection alarm ends up strictly after rcvTime.
+func TestSentPacketHandlerTimeThresholdNoOverflow(t *testing.T) {
+	// 1e15 * a typical RTT in nanoseconds (~1e9) = 1e24, well past int64's
+	// ~9.2e18 max.
+	const hugeThreshold = 1e15
+
+	sph := NewSentPacketHandler(
+		0,
+		1200,
+		utils.NewRTTStats(),
+		&utils.ConnectionStats{},
+		true,
+		false,
+		nil,
+		protocol.PerspectiveClient,
+		nil,
+		utils.DefaultLogger,
+		0,
+		hugeThreshold,
+	)
+
+	var packets packetTracker
+	start := monotime.Now()
+	pns := make([]protocol.PacketNumber, 2)
+	for i := range pns {
+		pns[i] = sph.PopPacketNumber(protocol.Encryption1RTT)
+		sph.SentPacket(start, pns[i], protocol.InvalidPacketNumber, nil,
+			[]Frame{packets.NewPingFrame(pns[i])},
+			protocol.Encryption1RTT, protocol.ECNNon, 1000, false, false)
+	}
+
+	// ACK pns[1] one second later. detectLostPackets runs with
+	// huge timeThreshold * ~1s RTT — must NOT collapse to ~1ms loss delay,
+	// AND must produce a loss timer in the future (not wrapped into the past).
+	rcvTime := start.Add(time.Second)
+	_, err := sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: ackRanges(pns[1])},
+		protocol.Encryption1RTT,
+		rcvTime,
+	)
+	require.NoError(t, err)
+	require.NotContains(t, packets.Lost, pns[0],
+		"with a huge time threshold, the older packet must not be time-lost; "+
+			"a 1ms collapsed lossDelay would have declared it lost")
+	timeout := sph.GetLossDetectionTimeout()
+	require.NotZero(t, timeout, "an outstanding ack-eliciting packet must arm the loss timer")
+	require.True(t, timeout.After(rcvTime),
+		"loss-detection alarm must be in the future, not wrapped into the past via overflow; "+
+			"alarm=%d rcvTime=%d", int64(timeout), int64(rcvTime))
+}
+
 func newMockedSPH(t *testing.T) (SentPacketHandler, *mocks.MockSendAlgorithmWithDebugInfos) {
 	t.Helper()
 	cong := mocks.NewMockSendAlgorithmWithDebugInfos(gomock.NewController(t))
@@ -1726,6 +1943,8 @@ func newMockedSPH(t *testing.T) (SentPacketHandler, *mocks.MockSendAlgorithmWith
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 	sph.(*sentPacketHandler).congestion = cong
 	return sph, cong
@@ -2201,6 +2420,8 @@ func TestSentPacketHandlerMigratedPathClearsLostPackets(t *testing.T) {
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 
 	var packets packetTracker
@@ -2272,6 +2493,8 @@ func benchmarkSendAndAcknowledge(b *testing.B, ackEvery, inFlight int) {
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
+		0,
+		0,
 	)
 	now := monotime.Now()
 	sph.DropPackets(protocol.EncryptionInitial, now)
