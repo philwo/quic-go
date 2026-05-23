@@ -395,10 +395,55 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		h.setLossDetectionTimer(rcvTime)
 	}
 
+	// Detect spurious losses early — before the empty-ackedPackets early
+	// return below, before the ECN OnCongestionEvent, and before
+	// detectLostPackets / the per-packet OnPacketAcked loop. The undo has
+	// to run first in three independent scenarios that one ACK can present:
+	//   (a) The ACK ONLY covers packets already declared lost (they're
+	//       gone from history, so detectAndRemoveAckedPackets returns an
+	//       empty ackedPackets list and we'd otherwise hit the early
+	//       return without ever telling the congestion controller).
+	//   (b) The ACK also signals ECN-CE. The ECN-driven OnCongestionEvent
+	//       below would otherwise apply a fresh cut on the already-reduced
+	//       cwnd and overwrite preCutback with that post-cut snapshot;
+	//       OnSpuriousLoss for the older packet would then look stale
+	//       (predates the new snapshot's epoch) and bail out.
+	//   (c) The ACK also raises largestAcked enough to declare a *later*
+	//       gap lost in detectLostPackets, or acks post-cutback packets
+	//       in the OnPacketAcked loop that exit recovery and grow cwnd.
+	//       Same "fresh cut/growth overwrites the snapshot" problem.
+	// Running the undo first lets (b)'s ECN cut and (c)'s fresh
+	// detectLostPackets cut start from the restored state, and lets the
+	// OnPacketAcked growth build on top of it.
+	//
+	// Run for every 1-RTT ACK, including reordered ones whose LargestAcked
+	// is below the current largest. Such an ACK can still carry ranges that
+	// retroactively cover packets we declared lost; detectSpuriousLosses's
+	// inner loop (AckRanges is highest-first, lostPackets iterates ascending
+	// PN) skips out-of-range entries correctly and bails when the iteration
+	// crosses ack.LargestAcked.
+	var foundSpurious bool
+	if encLevel == protocol.Encryption1RTT {
+		foundSpurious = h.detectSpuriousLosses(
+			ack,
+			rcvTime.Add(-min(ack.DelayTime, h.rttStats.MaxAckDelay())),
+		)
+	}
+
 	priorInFlight := h.bytesInFlight
 	ackedPackets, hasAckEliciting, err := h.detectAndRemoveAckedPackets(ack, encLevel)
-	if err != nil || len(ackedPackets) == 0 {
+	if err != nil {
 		return false, err
+	}
+	// An ACK that covers ONLY packets we already declared lost surfaces no
+	// ackedPackets, but if detectSpuriousLosses confirmed any of them
+	// spurious, the rest of this function still has to run: the PTO backoff
+	// must reset, the loss-detection timer must be recomputed against the
+	// restored cwnd, and qlog needs the metrics update. Returning early
+	// would leave the sender parked at a stale PTO count even though an
+	// ack-eliciting packet was, in fact, acknowledged.
+	if len(ackedPackets) == 0 && !foundSpurious {
+		return false, nil
 	}
 	// update the RTT, if:
 	// * the largest acked is newly acknowledged, AND
@@ -420,6 +465,22 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 			h.congestion.MaybeExitSlowStart()
 		}
 	}
+	// Prune aged-out lost-packet history. Must run *after* UpdateRTT: if this
+	// ACK raised the RTT, the new PTO is larger, so the previous (smaller) PTO
+	// would evict entries still within the new 3*PTO window and silently drop
+	// the OnSpuriousLoss a subsequent ACK would otherwise drive.
+	//
+	// Any CongestionInformed entry aging out without being confirmed spurious
+	// abandons the controller's per-epoch undo: lossesInEpoch was incremented
+	// for it, no later ACK can decrement it, and the cut would otherwise stay
+	// half-resolved forever.
+	if encLevel == protocol.Encryption1RTT {
+		for _, lp := range h.lostPackets.DeleteBefore(rcvTime.Add(-3 * h.rttStats.PTO(false))) {
+			if lp.CongestionInformed {
+				h.congestion.AbandonSpuriousLossUndo(lp.PacketNumber)
+			}
+		}
+	}
 
 	// Only inform the ECN tracker about new 1-RTT ACKs if the ACK increases the largest acked.
 	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil && largestAcked > pnSpace.largestAcked {
@@ -435,6 +496,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	if encLevel == protocol.Encryption1RTT {
 		h.detectLostPathProbes(rcvTime)
 	}
+
 	var acked1RTTPacket bool
 	for _, p := range ackedPackets {
 		if p.includedInBytesInFlight {
@@ -447,16 +509,6 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		if !p.isPathProbePacket {
 			putPacket(p.packet)
 		}
-	}
-
-	// detect spurious losses for application data packets, if the ACK was not reordered
-	if encLevel == protocol.Encryption1RTT && largestAcked == pnSpace.largestAcked {
-		h.detectSpuriousLosses(
-			ack,
-			rcvTime.Add(-min(ack.DelayTime, h.rttStats.MaxAckDelay())),
-		)
-		// clean up lost packet history
-		h.lostPackets.DeleteBefore(rcvTime.Add(-3 * h.rttStats.PTO(false)))
 	}
 
 	// After this point, we must not use ackedPackets any longer!
@@ -482,15 +534,32 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	return acked1RTTPacket, nil
 }
 
-func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime monotime.Time) {
+// detectSpuriousLosses scans the lost-packet tracker for entries that the
+// given ACK now covers, removes them, and notifies the congestion controller.
+// Returns true if any spurious entry was found, so the caller can keep
+// processing this ACK even when it acked no in-flight packets — a spurious
+// confirmation still represents forward progress and the post-ACK cleanup
+// (PTO backoff reset, loss-detection timer recompute, qlog metrics) must run.
+func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime monotime.Time) bool {
 	var maxPacketReordering protocol.PacketNumber
 	var maxTimeReordering time.Duration
 	ackRangeIdx := len(ack.AckRanges) - 1
-	var spuriousLosses []protocol.PacketNumber
-	for pn, sendTime := range h.lostPackets.All() {
+	type spuriousEntry struct {
+		pn                 protocol.PacketNumber
+		congestionInformed bool
+	}
+	var spuriousLosses []spuriousEntry
+	for lp := range h.lostPackets.All() {
+		pn := lp.PacketNumber
 		ackRange := ack.AckRanges[ackRangeIdx]
 		for pn > ackRange.Largest {
-			// this should never happen, since detectSpuriousLosses is only called for ACKs that increase the largest acked
+			// pn exceeds the current range's Largest — try the next-higher
+			// range. ackRangeIdx==0 means we've already considered the
+			// highest range (AckRanges is ordered highest-first), so pn is
+			// above ack.LargestAcked entirely. That's reachable for reordered
+			// ACK frames whose LargestAcked is below the current largest;
+			// we just skip this lp, and since lostPackets iterates ascending
+			// PN, all subsequent lps are also skipped.
 			if ackRangeIdx == 0 {
 				break
 			}
@@ -502,7 +571,7 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 		}
 		if pn <= ackRange.Largest {
 			packetReordering := h.appDataPackets.history.Difference(ack.LargestAcked(), pn)
-			timeReordering := ackTime.Sub(sendTime)
+			timeReordering := ackTime.Sub(lp.SendTime)
 			maxPacketReordering = max(maxPacketReordering, packetReordering)
 			maxTimeReordering = max(maxTimeReordering, timeReordering)
 
@@ -514,12 +583,21 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 					TimeReordering:   timeReordering,
 				})
 			}
-			spuriousLosses = append(spuriousLosses, pn)
+			spuriousLosses = append(spuriousLosses, spuriousEntry{pn: pn, congestionInformed: lp.CongestionInformed})
 		}
 	}
-	for _, pn := range spuriousLosses {
-		h.lostPackets.Delete(pn)
+	for _, sl := range spuriousLosses {
+		h.lostPackets.Delete(sl.pn)
+		// Only notify the congestion controller if this loss was originally
+		// reported to it. Non-ack-eliciting and Path-MTU-probe packets are
+		// tracked here for qlog purposes only; calling OnSpuriousLoss for
+		// them would decrement an epoch counter for a loss the controller
+		// never counted, and could spuriously undo a sibling real cutback.
+		if sl.congestionInformed {
+			h.congestion.OnSpuriousLoss(sl.pn)
+		}
 	}
+	return len(spuriousLosses) > 0
 }
 
 // Packets are returned in ascending packet number order.
@@ -845,19 +923,27 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 			pnSpace.lossTime = lossTime
 		}
 		if packetLost {
-			if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
-				h.lostPackets.Add(pn, p.SendTime)
-			}
 			pnSpace.history.DeclareLost(pn)
+			var congestionInformed bool
 			if !p.isPathProbePacket && p.IsAckEliciting() {
 				// the bytes in flight need to be reduced no matter if the frames in this packet will be retransmitted
 				h.removeFromBytesInFlight(p)
 				h.queueFramesForRetransmission(p)
 				if !p.IsPathMTUProbePacket {
 					h.congestion.OnCongestionEvent(pn, p.Length, priorInFlight)
+					congestionInformed = true
 				}
 				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
 					h.ecnTracker.LostPacket(pn)
+				}
+			}
+			if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
+				evicted, didEvict := h.lostPackets.Add(pn, p.SendTime, congestionInformed)
+				if didEvict && evicted.CongestionInformed {
+					// Capacity overflow dropped a counted loss without it being
+					// confirmed spurious — abandon the controller's snapshot
+					// so its lossesInEpoch counter doesn't stay stranded.
+					h.congestion.AbandonSpuriousLossUndo(evicted.PacketNumber)
 				}
 			}
 		}
@@ -1131,6 +1217,14 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 	for pn := range h.appDataPackets.history.PathProbes() {
 		h.appDataPackets.history.RemovePathProbe(pn)
 	}
+	// Drop the spurious-loss tracker before swapping in the fresh congestion
+	// controller. Old-path entries with CongestionInformed=true would
+	// otherwise survive into detectSpuriousLosses: an ACK received on the
+	// new path that retroactively covers one of those PNs would call
+	// OnSpuriousLoss on the fresh sender, whose snapshot starts from
+	// InvalidPacketNumber, so the old (now-large-positive) PN looks
+	// "in-epoch" against the next real new-path cut and can undo it.
+	h.lostPackets = *newLostPacketTracker(64)
 	h.congestion = congestion.NewCubicSender(
 		congestion.DefaultClock{},
 		h.rttStats,

@@ -221,6 +221,538 @@ func TestCubicSenderSlowStartPacketLoss(t *testing.T) {
 	require.False(t, sender.sender.hybridSlowStart.Started())
 }
 
+// TestCubicSenderSpuriousLossUndo verifies that a cwnd cutback is rolled back
+// when the packet that triggered it is later detected as spurious.
+func TestCubicSenderSpuriousLossUndo(t *testing.T) {
+	sender := newTestCubicSender(false)
+
+	// Build cwnd in slow start.
+	const numberOfAcks = 10
+	for range numberOfAcks {
+		sender.SendAvailableSendWindow()
+		sender.AckNPackets(2)
+	}
+	sender.SendAvailableSendWindow()
+	preCutWindow := defaultWindowTCP + (maxDatagramSize * 2 * numberOfAcks)
+	require.Equal(t, preCutWindow, sender.sender.GetCongestionWindow())
+
+	// Declare a packet lost.
+	losePN := sender.ackedPacketNumber + 1
+	sender.LosePacket(losePN)
+	require.Less(t, sender.sender.GetCongestionWindow(), preCutWindow,
+		"cwnd should have shrunk after loss")
+	require.True(t, sender.sender.InRecovery())
+
+	// Later we discover the loss was spurious. The undo should restore cwnd.
+	sender.sender.OnSpuriousLoss(losePN)
+	require.Equal(t, preCutWindow, sender.sender.GetCongestionWindow(),
+		"cwnd should be restored to pre-cut value")
+	require.False(t, sender.sender.InRecovery(),
+		"undo should also exit recovery state")
+
+	// A second spurious-loss notification for the same epoch is a no-op
+	// (the snapshot has been consumed).
+	sender.sender.OnSpuriousLoss(losePN)
+	require.Equal(t, preCutWindow, sender.sender.GetCongestionWindow())
+
+	// A real loss after undo cuts again, from the restored cwnd.
+	losePN2 := sender.ackedPacketNumber + 2
+	sender.LosePacket(losePN2)
+	require.Less(t, sender.sender.GetCongestionWindow(), preCutWindow,
+		"a fresh real loss after undo should still cut")
+}
+
+// TestCubicSenderSpuriousLossPartialEpoch verifies that if only some packets
+// from the cutback's epoch are later confirmed spurious, the cut is NOT
+// undone — at least one sibling could still be a real loss whose congestion
+// signal we must respect.
+func TestCubicSenderSpuriousLossPartialEpoch(t *testing.T) {
+	sender := newTestCubicSender(false)
+
+	const numberOfAcks = 10
+	for range numberOfAcks {
+		sender.SendAvailableSendWindow()
+		sender.AckNPackets(2)
+	}
+	sender.SendAvailableSendWindow()
+	preCutWindow := defaultWindowTCP + (maxDatagramSize * 2 * numberOfAcks)
+	require.Equal(t, preCutWindow, sender.sender.GetCongestionWindow())
+
+	// Two losses in the same recovery epoch: the first cuts cwnd, the
+	// second is folded into the same loss event (no further cut) but still
+	// counts towards the undo accounting.
+	losePN1 := sender.ackedPacketNumber + 1
+	losePN2 := sender.ackedPacketNumber + 2
+	sender.LoseNPackets(2)
+	afterCutWindow := sender.sender.GetCongestionWindow()
+	require.Less(t, afterCutWindow, preCutWindow)
+	require.True(t, sender.sender.InRecovery())
+
+	// Confirm only the first packet was spurious. The other is — for all
+	// we know so far — a genuine loss. The cut must stand.
+	sender.sender.OnSpuriousLoss(losePN1)
+	require.Equal(t, afterCutWindow, sender.sender.GetCongestionWindow(),
+		"with one loss still unresolved, cut must stand")
+	require.True(t, sender.sender.InRecovery(),
+		"still in recovery — partial spurious confirmation is not enough to exit")
+
+	// Now the second is also confirmed spurious. The whole epoch is bogus
+	// — undo the cut.
+	sender.sender.OnSpuriousLoss(losePN2)
+	require.Equal(t, preCutWindow, sender.sender.GetCongestionWindow(),
+		"with all epoch losses spurious, the cut should be undone")
+	require.False(t, sender.sender.InRecovery())
+}
+
+// TestCubicSenderSpuriousLossPreservesRenoAckCount verifies that the Reno
+// additive-increase ACK counter (numAckedPackets) survives a spurious-loss
+// undo. OnCongestionEvent zeros it on every cut; without snapshotting it the
+// undo would discard up to one window of CA growth credit even though the
+// cutback itself was rolled back.
+func TestCubicSenderSpuriousLossPreservesRenoAckCount(t *testing.T) {
+	sender := newTestCubicSender(false) // Reno
+
+	// Force the sender out of slow start so that subsequent acks accumulate
+	// numAckedPackets in the CA path instead of bumping cwnd directly.
+	sender.sender.slowStartThreshold = sender.sender.congestionWindow
+
+	// Fill the window and ack a few packets to accumulate CA credit.
+	sender.SendAvailableSendWindow()
+	sender.AckNPackets(3)
+	preCutAckCount := sender.sender.numAckedPackets
+	require.NotZero(t, preCutAckCount, "expected CA ack credit to accumulate before the cut")
+
+	// Send more so we have something in-flight to lose, then trigger the cut.
+	sender.SendAvailableSendWindow()
+	losePN := sender.ackedPacketNumber + 1
+	sender.LosePacket(losePN)
+	require.Zero(t, sender.sender.numAckedPackets,
+		"OnCongestionEvent resets numAckedPackets — sanity check")
+
+	// Spurious-loss undo must restore the pre-cut CA ack credit.
+	sender.sender.OnSpuriousLoss(losePN)
+	require.Equal(t, preCutAckCount, sender.sender.numAckedPackets,
+		"spurious-loss undo must restore Reno's accumulated CA ACK credit")
+}
+
+// TestCubicSenderSpuriousLossPreservesGrowthOnExactCatchUp verifies that if
+// post-cut CA growth raised cwnd back to *exactly* the pre-cut snapshot value
+// before OnSpuriousLoss fires, the undo does NOT overwrite numAckedPackets or
+// the Cubic state with the pre-cut snapshot. Reno cwnd advances in MSS-sized
+// steps, so landing on the snapshot's cwnd is plausible; the live
+// numAckedPackets / Cubic at that point already carry genuine post-cut CA
+// progress and must be preserved. ssthresh and the other epoch markers are
+// still restored unconditionally.
+func TestCubicSenderSpuriousLossPreservesGrowthOnExactCatchUp(t *testing.T) {
+	sender := newTestCubicSender(false) // Reno
+
+	// Build cwnd above defaults so the cut won't be clamped at min.
+	const numberOfAcks = 10
+	for range numberOfAcks {
+		sender.SendAvailableSendWindow()
+		sender.AckNPackets(2)
+	}
+	sender.SendAvailableSendWindow()
+	preCutWindow := defaultWindowTCP + (maxDatagramSize * 2 * numberOfAcks)
+	require.Equal(t, preCutWindow, sender.sender.GetCongestionWindow())
+
+	losePN := sender.ackedPacketNumber + 1
+	sender.LosePacket(losePN)
+	require.Less(t, sender.sender.GetCongestionWindow(), preCutWindow,
+		"sanity: a non-clamped cut should actually reduce cwnd")
+	require.NotNil(t, sender.sender.preCutback)
+	require.False(t, sender.sender.preCutback.clamped,
+		"sanity: a cut that moved cwnd should record clamped=false")
+
+	// Simulate the cross-ACK catch-up: post-cut ACKs in earlier ReceivedAck
+	// calls have exited recovery and grown cwnd back to *exactly* the pre-cut
+	// value, also accumulating fresh Reno CA credit. Set state directly so
+	// the test asserts the OnSpuriousLoss gate in isolation.
+	const postCutAckCount = uint64(7)
+	sender.sender.congestionWindow = preCutWindow
+	sender.sender.numAckedPackets = postCutAckCount
+
+	// Spurious-loss confirmation arrives now. With the cut not clamped and
+	// cwnd having caught up exactly, the undo must NOT overwrite the live
+	// numAckedPackets (post-cut credit) with the snapshot's value.
+	sender.sender.OnSpuriousLoss(losePN)
+	require.Equal(t, preCutWindow, sender.sender.GetCongestionWindow(),
+		"cwnd should be unchanged (it already equals the snapshot)")
+	require.Equal(t, postCutAckCount, sender.sender.numAckedPackets,
+		"exact catch-up after a non-clamped cut must preserve post-cut Reno credit")
+	require.Nil(t, sender.sender.preCutback,
+		"snapshot should be cleared after the undo")
+}
+
+// TestCubicSenderSpuriousLossNoRewindAfterGrowth verifies that if cwnd has
+// already grown at or past the pre-cut snapshot by the time OnSpuriousLoss
+// fires, the undo is suppressed — restoring the (now-smaller) snapshot
+// would reduce cwnd and discard newer Cubic/Reno state.
+//
+// This guards the cross-ACK case the ReceivedAck-internal ordering can't
+// cover: between the cutback and the ACK that finally proves it spurious,
+// ACKs in *earlier* ReceivedAck calls can ack post-cutback packets, exit
+// recovery, and resume cwnd growth via OnPacketAcked. By the time the
+// spurious-loss confirmation arrives, the cut has effectively been undone
+// by normal growth.
+func TestCubicSenderSpuriousLossNoRewindAfterGrowth(t *testing.T) {
+	sender := newTestCubicSender(false) // Reno
+
+	// Build cwnd, then trigger a cut.
+	const numberOfAcks = 10
+	for range numberOfAcks {
+		sender.SendAvailableSendWindow()
+		sender.AckNPackets(2)
+	}
+	sender.SendAvailableSendWindow()
+	preCutWindow := defaultWindowTCP + (maxDatagramSize * 2 * numberOfAcks)
+	require.Equal(t, preCutWindow, sender.sender.GetCongestionWindow())
+
+	losePN := sender.ackedPacketNumber + 1
+	sender.LosePacket(losePN)
+	require.Less(t, sender.sender.GetCongestionWindow(), preCutWindow)
+	require.NotNil(t, sender.sender.preCutback, "snapshot should be set after the cut")
+
+	// Simulate the cross-ACK scenario: post-cutback ACKs in earlier
+	// ReceivedAck calls have exited recovery and grown cwnd past the
+	// pre-cut value, also accumulating Reno CA ACK credit and advancing
+	// the Cubic state. Set the state directly so the test asserts the
+	// OnSpuriousLoss guard in isolation.
+	grownWindow := preCutWindow + 5*maxDatagramSize
+	grownAckCount := uint64(7)
+	sender.sender.congestionWindow = grownWindow
+	sender.sender.numAckedPackets = grownAckCount
+
+	// Spurious-loss confirmation arrives now. The undo must NOT rewind
+	// cwnd to the (smaller) pre-cut snapshot, must NOT discard the Reno
+	// ACK credit, and must still clear the snapshot so a future cut can
+	// take a fresh one.
+	sender.sender.OnSpuriousLoss(losePN)
+	require.Equal(t, grownWindow, sender.sender.GetCongestionWindow(),
+		"undo must not reduce cwnd below post-cut growth")
+	require.Equal(t, grownAckCount, sender.sender.numAckedPackets,
+		"undo must not discard accumulated CA ACK credit when skipped")
+	require.Nil(t, sender.sender.preCutback,
+		"snapshot should be cleared even when the restore is skipped")
+
+	// A fresh real loss after the skipped undo still cuts, from the
+	// current (grown) cwnd — i.e. preCutback was actually cleared, so
+	// OnCongestionEvent for a higher PN treats this as a fresh epoch.
+	// Send new packets first so the next loss has a PN strictly above the
+	// stale largestSentAtLastCutback (left untouched by the skipped undo).
+	sender.SendAvailableSendWindow()
+	losePN2 := sender.packetNumber - 1
+	sender.LosePacket(losePN2)
+	require.Less(t, sender.sender.GetCongestionWindow(), grownWindow,
+		"a fresh real loss after a skipped undo should still cut")
+}
+
+// TestCubicSenderSpuriousLossUndoesClampedCut verifies that a spurious-loss
+// undo restores the epoch markers (ssthresh, largestSentAtLastCutback,
+// lastCutbackExitedSlowstart) even when the cut itself was clamped at
+// minCongestionWindow — i.e. cwnd didn't move numerically. Without this,
+// the "cwnd hasn't grown past pre-cut" guard would treat the no-op cut as
+// post-cut growth, drop the snapshot, and leave the sender stuck in CA at
+// the minimum with ssthresh = minCongestionWindow even though the loss
+// turned out to be false.
+func TestCubicSenderSpuriousLossUndoesClampedCut(t *testing.T) {
+	sender := newTestCubicSender(false) // Reno
+
+	// Drive cwnd down to minCongestionWindow so the next cut is clamped.
+	// Each LosePacket multiplies by Reno beta (0.7) and clamps to min once
+	// the product falls below it; loop a few times to be safe.
+	for sender.sender.GetCongestionWindow() > sender.sender.minCongestionWindow() {
+		sender.SendAvailableSendWindow()
+		sender.LosePacket(sender.packetNumber - 1)
+		// Advance largestAckedPacketNumber past largestSentAtLastCutback so
+		// subsequent LosePackets create fresh epochs (and to avoid being
+		// "stuck in recovery" for the next iteration).
+		sender.AckNPackets(1)
+	}
+	require.Equal(t, sender.sender.minCongestionWindow(), sender.sender.GetCongestionWindow(),
+		"sanity: cwnd should be parked at the minimum before the clamped cut")
+
+	// Restore a pre-cut ssthresh that's well above minCW so we can assert
+	// the undo restores it (otherwise it'd already equal post-cut ssthresh
+	// and the test would be vacuous).
+	const preCutSsthresh = protocol.ByteCount(123456)
+	sender.sender.slowStartThreshold = preCutSsthresh
+	preCutLargestAtCutback := sender.sender.largestSentAtLastCutback
+
+	// Trigger the to-be-spurious cut. Send a fresh packet so its PN is
+	// strictly greater than largestSentAtLastCutback (otherwise the new loss
+	// would fold into the previous epoch instead of taking a fresh snapshot).
+	sender.SendAvailableSendWindow()
+	losePN := sender.packetNumber - 1
+	sender.LosePacket(losePN)
+	require.Equal(t, sender.sender.minCongestionWindow(), sender.sender.GetCongestionWindow(),
+		"clamped cut should keep cwnd at the minimum")
+	require.Equal(t, sender.sender.minCongestionWindow(), sender.sender.slowStartThreshold,
+		"clamped cut should drop ssthresh to the cwnd (=min)")
+	require.NotEqual(t, preCutLargestAtCutback, sender.sender.largestSentAtLastCutback,
+		"clamped cut should still bump largestSentAtLastCutback")
+	require.NotNil(t, sender.sender.preCutback)
+
+	// Spurious-loss confirmation: even though cwnd didn't move (and the
+	// "cwnd grew past pre-cut" guard might otherwise drop the snapshot
+	// without restoring anything), the epoch markers must be restored.
+	sender.sender.OnSpuriousLoss(losePN)
+	require.Equal(t, preCutSsthresh, sender.sender.slowStartThreshold,
+		"spurious-loss undo must restore ssthresh even when the cut was clamped")
+	require.Equal(t, preCutLargestAtCutback, sender.sender.largestSentAtLastCutback,
+		"spurious-loss undo must restore largestSentAtLastCutback even when the cut was clamped")
+	require.Nil(t, sender.sender.preCutback,
+		"snapshot should be cleared after the undo")
+	require.True(t, sender.sender.InSlowStart(),
+		"with ssthresh restored well above cwnd, the sender should be back in SS")
+}
+
+// TestCubicSenderSpuriousLossUndoesClampedCutPreservesRenoCredit verifies
+// that when the cut was clamped at minCongestionWindow (cwnd unchanged) and
+// OnCongestionEvent zeroed numAckedPackets, the spurious-loss undo restores
+// that pre-cut Reno credit too. The cwnd-restore guard must include the
+// equality case so the false-loss-at-min path doesn't permanently delay the
+// next CA cwnd increment.
+func TestCubicSenderSpuriousLossUndoesClampedCutPreservesRenoCredit(t *testing.T) {
+	sender := newTestCubicSender(false) // Reno
+
+	// Force the sender into CA at the minimum cwnd so the next loss is
+	// both clamped AND happens with non-zero accumulated Reno credit.
+	sender.sender.congestionWindow = sender.sender.minCongestionWindow()
+	sender.sender.slowStartThreshold = sender.sender.congestionWindow
+	const preCutCredit = uint64(3)
+	sender.sender.numAckedPackets = preCutCredit
+
+	// Trigger the to-be-spurious clamped cut. SendAvailableSendWindow
+	// fills up to cwnd; the resulting LosePacket targets a PN strictly
+	// greater than largestSentAtLastCutback (InvalidPacketNumber here),
+	// so it takes a fresh snapshot.
+	sender.SendAvailableSendWindow()
+	losePN := sender.packetNumber - 1
+	sender.LosePacket(losePN)
+	require.Equal(t, sender.sender.minCongestionWindow(), sender.sender.GetCongestionWindow(),
+		"sanity: cut must be clamped at the minimum window")
+	require.Zero(t, sender.sender.numAckedPackets,
+		"sanity: OnCongestionEvent zeros numAckedPackets")
+	require.NotNil(t, sender.sender.preCutback)
+
+	// Spurious-loss confirmation: even though c.cwnd == s.cwnd (clamped),
+	// the Reno credit must be restored. The cwnd assignment in the restore
+	// is a no-op, but numAckedPackets / cubic restoration are not.
+	sender.sender.OnSpuriousLoss(losePN)
+	require.Equal(t, preCutCredit, sender.sender.numAckedPackets,
+		"spurious-loss undo must restore Reno CA credit even when the cut was clamped — "+
+			"otherwise the false loss permanently delays the next cwnd increment")
+}
+
+// TestCubicSenderSpuriousLossSnapshotClearedOnRTO verifies that an RTO drops
+// the pre-RTO spurious-loss snapshot. Otherwise a later OnSpuriousLoss for a
+// pre-RTO loss could restore the pre-RTO cwnd/ssthresh, undoing the RTO's
+// drop-to-min and reverting the response to whatever-it-was-prompted-the-RTO.
+func TestCubicSenderSpuriousLossSnapshotClearedOnRTO(t *testing.T) {
+	sender := newTestCubicSender(false)
+
+	// Build cwnd, take a loss → populates preCutback.
+	const numberOfAcks = 10
+	for range numberOfAcks {
+		sender.SendAvailableSendWindow()
+		sender.AckNPackets(2)
+	}
+	sender.SendAvailableSendWindow()
+	preCutWindow := defaultWindowTCP + (maxDatagramSize * 2 * numberOfAcks)
+	require.Equal(t, preCutWindow, sender.sender.GetCongestionWindow())
+
+	losePN := sender.ackedPacketNumber + 1
+	sender.LosePacket(losePN)
+	require.Less(t, sender.sender.GetCongestionWindow(), preCutWindow)
+	require.NotNil(t, sender.sender.preCutback)
+	require.NotZero(t, sender.sender.lossesInEpoch)
+
+	// RTO. Resets cwnd to min, ssthresh to half-current. preCutback /
+	// lossesInEpoch must also be cleared so a late OnSpuriousLoss for the
+	// pre-RTO loss can't undo the RTO reset.
+	sender.sender.OnRetransmissionTimeout(true)
+	require.Equal(t, sender.sender.minCongestionWindow(), sender.sender.GetCongestionWindow(),
+		"sanity: RTO resets cwnd to the minimum")
+	require.Nil(t, sender.sender.preCutback,
+		"RTO must drop the pre-RTO spurious-loss snapshot")
+	require.Zero(t, sender.sender.lossesInEpoch,
+		"RTO must reset the per-epoch loss counter")
+
+	// A late OnSpuriousLoss for the pre-RTO loss must be a no-op. cwnd /
+	// ssthresh remain at the RTO values.
+	rtoCwnd := sender.sender.GetCongestionWindow()
+	rtoSsthresh := sender.sender.slowStartThreshold
+	sender.sender.OnSpuriousLoss(losePN)
+	require.Equal(t, rtoCwnd, sender.sender.GetCongestionWindow(),
+		"OnSpuriousLoss for a pre-RTO loss must not undo the RTO reset")
+	require.Equal(t, rtoSsthresh, sender.sender.slowStartThreshold,
+		"OnSpuriousLoss for a pre-RTO loss must not restore the pre-RTO ssthresh")
+}
+
+// TestCubicSenderSpuriousLossSnapshotClearedOnConnectionMigration verifies
+// the same property as the RTO test, but on the connection-migration reset
+// path. The fresh-path's initial cwnd / ssthresh must not be undone by a
+// stale pre-migration spurious-loss snapshot.
+func TestCubicSenderSpuriousLossSnapshotClearedOnConnectionMigration(t *testing.T) {
+	sender := newTestCubicSender(false)
+
+	const numberOfAcks = 10
+	for range numberOfAcks {
+		sender.SendAvailableSendWindow()
+		sender.AckNPackets(2)
+	}
+	sender.SendAvailableSendWindow()
+	losePN := sender.ackedPacketNumber + 1
+	sender.LosePacket(losePN)
+	require.NotNil(t, sender.sender.preCutback)
+	require.NotZero(t, sender.sender.lossesInEpoch)
+
+	sender.sender.OnConnectionMigration()
+	require.Nil(t, sender.sender.preCutback,
+		"OnConnectionMigration must drop the pre-migration spurious-loss snapshot")
+	require.Zero(t, sender.sender.lossesInEpoch,
+		"OnConnectionMigration must reset the per-epoch loss counter")
+
+	initialCwnd := sender.sender.GetCongestionWindow()
+	initialSsthresh := sender.sender.slowStartThreshold
+	sender.sender.OnSpuriousLoss(losePN)
+	require.Equal(t, initialCwnd, sender.sender.GetCongestionWindow(),
+		"OnSpuriousLoss for a pre-migration loss must not change the post-migration cwnd")
+	require.Equal(t, initialSsthresh, sender.sender.slowStartThreshold,
+		"OnSpuriousLoss for a pre-migration loss must not change the post-migration ssthresh")
+}
+
+// TestCubicSenderSpuriousLossStaleEpoch verifies that a spurious-loss
+// notification for a packet older than the current cutback epoch does NOT
+// undo — that snapshot is gone, and undoing the wrong cut would corrupt state.
+func TestCubicSenderSpuriousLossStaleEpoch(t *testing.T) {
+	sender := newTestCubicSender(false)
+
+	const numberOfAcks = 10
+	for range numberOfAcks {
+		sender.SendAvailableSendWindow()
+		sender.AckNPackets(2)
+	}
+	sender.SendAvailableSendWindow()
+	largeWindow := defaultWindowTCP + (maxDatagramSize * 2 * numberOfAcks)
+	require.Equal(t, largeWindow, sender.sender.GetCongestionWindow())
+
+	// First loss event, on some early PN.
+	oldLossPN := sender.ackedPacketNumber + 1
+	sender.LosePacket(oldLossPN)
+	afterFirstCut := sender.sender.GetCongestionWindow()
+	require.Less(t, afterFirstCut, largeWindow)
+
+	// Recover from first cut, advance past it.
+	for range 5 {
+		sender.AckNPackets(2)
+	}
+	sender.SendAvailableSendWindow()
+
+	// Second (real) loss event with a much higher PN — replaces the snapshot.
+	newLossPN := sender.packetNumber - 1
+	sender.LosePacket(newLossPN)
+	afterSecondCut := sender.sender.GetCongestionWindow()
+
+	// Now report the OLD loss as spurious. It belongs to a pre-current
+	// epoch, so the current cut must NOT be undone.
+	sender.sender.OnSpuriousLoss(oldLossPN)
+	require.Equal(t, afterSecondCut, sender.sender.GetCongestionWindow(),
+		"undo for stale epoch must not restore")
+}
+
+// TestCubicSenderAbandonSpuriousLossUndo verifies that AbandonSpuriousLossUndo
+// drops the current epoch's snapshot for an in-epoch PN — the case the
+// lost-packet tracker hits when a CongestionInformed entry is evicted on
+// capacity overflow or aged out by 3*PTO pruning before any spurious
+// confirmation arrives. Once dropped, subsequent OnSpuriousLoss calls bail
+// out at the nil check rather than spinning a stranded lossesInEpoch counter.
+// Stale-epoch PNs and the no-snapshot state must both be no-ops.
+func TestCubicSenderAbandonSpuriousLossUndo(t *testing.T) {
+	t.Run("in-epoch PN drops the snapshot", func(t *testing.T) {
+		sender := newTestCubicSender(false)
+
+		const numberOfAcks = 10
+		for range numberOfAcks {
+			sender.SendAvailableSendWindow()
+			sender.AckNPackets(2)
+		}
+		sender.SendAvailableSendWindow()
+
+		losePN := sender.ackedPacketNumber + 1
+		sender.LosePacket(losePN)
+		require.NotNil(t, sender.sender.preCutback,
+			"sanity: cut should establish a snapshot")
+		require.Equal(t, 1, sender.sender.lossesInEpoch,
+			"sanity: cut should set lossesInEpoch=1")
+
+		// Pretend the tracker evicted a different in-epoch counted loss.
+		// losePN is the only entry in the snapshot's epoch, so anything
+		// strictly greater than preCutback.largestSentAtLastCutback counts.
+		evictedPN := losePN + 1
+		sender.sender.AbandonSpuriousLossUndo(evictedPN)
+		require.Nil(t, sender.sender.preCutback,
+			"abandon for an in-epoch PN must clear preCutback")
+		require.Zero(t, sender.sender.lossesInEpoch,
+			"abandon for an in-epoch PN must clear lossesInEpoch")
+
+		// A later OnSpuriousLoss for losePN must now be a no-op — preCutback
+		// is gone, so there's nothing to undo. cwnd stays at the post-cut
+		// value (regression: without the abandon, lossesInEpoch would be
+		// stranded above zero and OnSpuriousLoss would silently decrement it
+		// without ever firing the restore).
+		postCutCwnd := sender.sender.GetCongestionWindow()
+		sender.sender.OnSpuriousLoss(losePN)
+		require.Equal(t, postCutCwnd, sender.sender.GetCongestionWindow(),
+			"OnSpuriousLoss after abandon must not restore cwnd")
+	})
+
+	t.Run("stale-epoch PN is a no-op", func(t *testing.T) {
+		sender := newTestCubicSender(false)
+
+		const numberOfAcks = 10
+		for range numberOfAcks {
+			sender.SendAvailableSendWindow()
+			sender.AckNPackets(2)
+		}
+		sender.SendAvailableSendWindow()
+
+		// First cut, advance past it, then a second cut — the second
+		// establishes the current epoch and supersedes the first snapshot.
+		oldLossPN := sender.ackedPacketNumber + 1
+		sender.LosePacket(oldLossPN)
+		for range 5 {
+			sender.AckNPackets(2)
+		}
+		sender.SendAvailableSendWindow()
+		newLossPN := sender.packetNumber - 1
+		sender.LosePacket(newLossPN)
+
+		snapshotBefore := sender.sender.preCutback
+		require.NotNil(t, snapshotBefore)
+		lossesBefore := sender.sender.lossesInEpoch
+
+		// Abandon for a PN from the first (now-stale) cut must not touch
+		// the current epoch's snapshot.
+		sender.sender.AbandonSpuriousLossUndo(oldLossPN)
+		require.Same(t, snapshotBefore, sender.sender.preCutback,
+			"abandon for a stale-epoch PN must not drop the current snapshot")
+		require.Equal(t, lossesBefore, sender.sender.lossesInEpoch,
+			"abandon for a stale-epoch PN must not change lossesInEpoch")
+	})
+
+	t.Run("no snapshot is a no-op", func(t *testing.T) {
+		sender := newTestCubicSender(false)
+		require.Nil(t, sender.sender.preCutback)
+
+		// No active snapshot — abandon should be safe and a no-op.
+		sender.sender.AbandonSpuriousLossUndo(42)
+		require.Nil(t, sender.sender.preCutback)
+		require.Zero(t, sender.sender.lossesInEpoch)
+	})
+}
+
 func TestCubicSenderSlowStartPacketLossPRR(t *testing.T) {
 	sender := newTestCubicSender(false)
 

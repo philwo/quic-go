@@ -1313,6 +1313,12 @@ func TestSentPacketHandlerECN(t *testing.T) {
 	// The second packet is still outstanding.
 	// Receive a (delayed) ACK for it.
 	// Since the new ECN counts were already reported, ECN marks on this ACK frame are ignored.
+	// pns[0] is in the lost-packet tracker (CongestionInformed=true). The new
+	// RTT sample on this ACK pushes 3*PTO above pns[0]'s age, so the tracker
+	// cleanup ages it out — that triggers AbandonSpuriousLossUndo since the
+	// loss can no longer be confirmed spurious by a later ACK.
+	lostPN0 := pns[0]
+	cong.EXPECT().AbandonSpuriousLossUndo(lostPN0)
 	now = now.Add(100 * time.Millisecond)
 	_, err = sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[1])}, protocol.Encryption1RTT, now)
 	require.NoError(t, err)
@@ -1702,6 +1708,541 @@ func TestSentPacketHandlerSpuriousLoss(t *testing.T) {
 		},
 		eventRecorder.Events(qlog.SpuriousLoss{}),
 	)
+}
+
+// newMockedSPH wires a SentPacketHandler whose congestion controller is a
+// gomock mock, returning both the SPH and the mock.
+func newMockedSPH(t *testing.T) (SentPacketHandler, *mocks.MockSendAlgorithmWithDebugInfos) {
+	t.Helper()
+	cong := mocks.NewMockSendAlgorithmWithDebugInfos(gomock.NewController(t))
+	sph := NewSentPacketHandler(
+		0,
+		1200,
+		utils.NewRTTStats(),
+		&utils.ConnectionStats{},
+		true,
+		false,
+		nil,
+		protocol.PerspectiveClient,
+		nil,
+		utils.DefaultLogger,
+	)
+	sph.(*sentPacketHandler).congestion = cong
+	return sph, cong
+}
+
+// TestSentPacketHandlerSpuriousLossSkipsMTUProbe verifies that when an
+// MTU-probe packet (whose original loss was never reported to congestion
+// control) is later retroactively acked, OnSpuriousLoss is NOT called for
+// it. Calling it would decrement a sibling cutback's epoch counter in the
+// CC and could cause an unrelated, genuine cut to be incorrectly undone.
+//
+// Setup mirrors TestSentPacketHandlerSpuriousLoss: small inter-send gaps
+// plus a long ACK delay keep the measured RTT large, so the 3*PTO
+// DeleteBefore window doesn't prune the lost-packet entries before the
+// follow-up ACK retroactively covers them.
+func TestSentPacketHandlerSpuriousLossSkipsMTUProbe(t *testing.T) {
+	sph, cong := newMockedSPH(t)
+
+	var packets packetTracker
+	sendPacket := func(t *testing.T, ti monotime.Time, mtuProbe bool) protocol.PacketNumber {
+		t.Helper()
+		pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+		cong.EXPECT().OnPacketSent(ti, gomock.Any(), pn, protocol.ByteCount(1000), true)
+		sph.SentPacket(ti, pn, protocol.InvalidPacketNumber, nil,
+			[]Frame{packets.NewPingFrame(pn)},
+			protocol.Encryption1RTT, protocol.ECNNon, 1000, mtuProbe, false)
+		return pn
+	}
+
+	// pns[0] is an MTU probe; the rest are normal ack-eliciting packets.
+	start := monotime.Now()
+	now := start
+	var pns []protocol.PacketNumber
+	for i := range 7 {
+		pns = append(pns, sendPacket(t, now, i == 0))
+		now = now.Add(10 * time.Millisecond)
+	}
+
+	// First ACK covers only pns[6]. Reordering threshold (default 3)
+	// declares pns[0..3] lost. pns[0] is the MTU probe — no OnCongestionEvent
+	// is fired for it; pns[1] triggers the cut, pns[2] and pns[3] fold into
+	// the same epoch.
+	ackTime := start.Add(time.Second)
+	cong.EXPECT().MaybeExitSlowStart()
+	cong.EXPECT().OnCongestionEvent(pns[1], protocol.ByteCount(1000), gomock.Any())
+	cong.EXPECT().OnCongestionEvent(pns[2], protocol.ByteCount(1000), gomock.Any())
+	cong.EXPECT().OnCongestionEvent(pns[3], protocol.ByteCount(1000), gomock.Any())
+	cong.EXPECT().OnPacketAcked(pns[6], protocol.ByteCount(1000), gomock.Any(), ackTime)
+	_, err := sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[6])}, protocol.Encryption1RTT, ackTime)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []protocol.PacketNumber{pns[0], pns[1], pns[2], pns[3]}, packets.Lost)
+
+	// Send one fresh packet after the cutback.
+	postCut := sendPacket(t, ackTime.Add(10*time.Millisecond), false)
+
+	// Second ACK covers pns[0..6] and postCut, retroactively acking every
+	// packet that was declared lost in the first ACK. detectSpuriousLosses
+	// must call OnSpuriousLoss for pns[1..3] (their losses were counted) but
+	// NOT for pns[0] (its loss was never counted — it's an MTU probe).
+	ackTime2 := ackTime.Add(50 * time.Millisecond)
+	cong.EXPECT().MaybeExitSlowStart()
+	cong.EXPECT().OnSpuriousLoss(pns[1])
+	cong.EXPECT().OnSpuriousLoss(pns[2])
+	cong.EXPECT().OnSpuriousLoss(pns[3])
+	// pns[0..3] and pns[6] are already out of history; pns[4], pns[5], and
+	// postCut are the fresh acks that drive OnPacketAcked.
+	cong.EXPECT().OnPacketAcked(pns[4], protocol.ByteCount(1000), gomock.Any(), ackTime2)
+	cong.EXPECT().OnPacketAcked(pns[5], protocol.ByteCount(1000), gomock.Any(), ackTime2)
+	cong.EXPECT().OnPacketAcked(postCut, protocol.ByteCount(1000), gomock.Any(), ackTime2)
+	_, err = sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: ackRanges(pns[0], pns[1], pns[2], pns[3], pns[4], pns[5], pns[6], postCut)},
+		protocol.Encryption1RTT, ackTime2,
+	)
+	require.NoError(t, err)
+	// gomock fails the test at cleanup if OnSpuriousLoss(pns[0]) was called.
+}
+
+// TestSentPacketHandlerSpuriousLossBeforeAckGrowth verifies that, within a
+// single ReceivedAck call, OnSpuriousLoss fires BEFORE the OnPacketAcked
+// calls for packets sent after the (now-undone) cutback. If the order were
+// reversed, OnPacketAcked could exit recovery and grow cwnd first, and the
+// subsequent undo would overwrite that newer state with the stale pre-cut
+// snapshot — effectively rewinding cwnd and Cubic state.
+func TestSentPacketHandlerSpuriousLossBeforeAckGrowth(t *testing.T) {
+	sph, cong := newMockedSPH(t)
+
+	var packets packetTracker
+	sendPacket := func(t *testing.T, ti monotime.Time) protocol.PacketNumber {
+		t.Helper()
+		pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+		cong.EXPECT().OnPacketSent(ti, gomock.Any(), pn, protocol.ByteCount(1000), true)
+		sph.SentPacket(ti, pn, protocol.InvalidPacketNumber, nil,
+			[]Frame{packets.NewPingFrame(pn)},
+			protocol.Encryption1RTT, protocol.ECNNon, 1000, false, false)
+		return pn
+	}
+
+	start := monotime.Now()
+	now := start
+	var pns []protocol.PacketNumber
+	for range 5 {
+		pns = append(pns, sendPacket(t, now))
+		now = now.Add(10 * time.Millisecond)
+	}
+
+	// First ACK covers only pns[4]; pns[0] and pns[1] are declared lost via
+	// the reordering threshold (Difference >= 3). pns[0] triggers the cut.
+	ackTime := start.Add(time.Second)
+	cong.EXPECT().MaybeExitSlowStart()
+	cong.EXPECT().OnCongestionEvent(pns[0], protocol.ByteCount(1000), gomock.Any())
+	cong.EXPECT().OnCongestionEvent(pns[1], protocol.ByteCount(1000), gomock.Any())
+	cong.EXPECT().OnPacketAcked(pns[4], protocol.ByteCount(1000), gomock.Any(), ackTime)
+	_, err := sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[4])}, protocol.Encryption1RTT, ackTime)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []protocol.PacketNumber{pns[0], pns[1]}, packets.Lost)
+
+	// Send a fresh packet AFTER the cutback (its PN > largestSentAtLastCutback).
+	postCut := sendPacket(t, ackTime.Add(10*time.Millisecond))
+
+	// Second ACK retroactively covers pns[0] and pns[1] (driving the spurious-
+	// loss undo) and freshly acks pns[2], pns[3], and postCut. The undo MUST
+	// happen before the per-packet ACK growth — assert via gomock.InOrder.
+	ackTime2 := ackTime.Add(50 * time.Millisecond)
+	cong.EXPECT().MaybeExitSlowStart()
+	postCutAck := cong.EXPECT().OnPacketAcked(postCut, protocol.ByteCount(1000), gomock.Any(), ackTime2)
+	gomock.InOrder(cong.EXPECT().OnSpuriousLoss(pns[0]), postCutAck)
+	gomock.InOrder(cong.EXPECT().OnSpuriousLoss(pns[1]), postCutAck)
+	cong.EXPECT().OnPacketAcked(pns[2], protocol.ByteCount(1000), gomock.Any(), ackTime2)
+	cong.EXPECT().OnPacketAcked(pns[3], protocol.ByteCount(1000), gomock.Any(), ackTime2)
+	_, err = sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: ackRanges(pns[0], pns[1], pns[2], pns[3], pns[4], postCut)},
+		protocol.Encryption1RTT, ackTime2,
+	)
+	require.NoError(t, err)
+}
+
+// TestSentPacketHandlerSpuriousLossBeforeFreshLoss verifies that, within a
+// single ReceivedAck call, OnSpuriousLoss for a retroactively-acked older
+// packet fires BEFORE OnCongestionEvent for losses freshly detected by the
+// same ACK. If the order were reversed, the fresh OnCongestionEvent would
+// overwrite the pre-cut snapshot with the already-reduced cwnd; the later
+// OnSpuriousLoss for the older packet would then look stale (predates the
+// new snapshot's epoch) and bail out — leaving the false cut in place AND
+// applying the fresh cut on top, double-cutting cwnd.
+func TestSentPacketHandlerSpuriousLossBeforeFreshLoss(t *testing.T) {
+	sph, cong := newMockedSPH(t)
+
+	var packets packetTracker
+	sendPacket := func(t *testing.T, ti monotime.Time) protocol.PacketNumber {
+		t.Helper()
+		pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+		cong.EXPECT().OnPacketSent(ti, gomock.Any(), pn, protocol.ByteCount(1000), true)
+		sph.SentPacket(ti, pn, protocol.InvalidPacketNumber, nil,
+			[]Frame{packets.NewPingFrame(pn)},
+			protocol.Encryption1RTT, protocol.ECNNon, 1000, false, false)
+		return pn
+	}
+
+	// Send 11 packets back-to-back so the second ACK can leave gaps among
+	// post-cut packets to drive a fresh reordering loss.
+	start := monotime.Now()
+	now := start
+	var pns []protocol.PacketNumber
+	for range 11 {
+		pns = append(pns, sendPacket(t, now))
+		now = now.Add(10 * time.Millisecond)
+	}
+
+	// First ACK covers pns[4] only. pns[0] and pns[1] are declared lost via
+	// the reordering threshold (Difference(4, 0)=4, Difference(4, 1)=3).
+	// pns[0] triggers the cut; pns[1] folds into the same epoch.
+	ackTime := start.Add(time.Second)
+	cong.EXPECT().MaybeExitSlowStart()
+	cong.EXPECT().OnCongestionEvent(pns[0], protocol.ByteCount(1000), gomock.Any())
+	cong.EXPECT().OnCongestionEvent(pns[1], protocol.ByteCount(1000), gomock.Any())
+	cong.EXPECT().OnPacketAcked(pns[4], protocol.ByteCount(1000), gomock.Any(), ackTime)
+	_, err := sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[4])}, protocol.Encryption1RTT, ackTime)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []protocol.PacketNumber{pns[0], pns[1]}, packets.Lost)
+
+	// Second ACK simultaneously:
+	//   (a) retroactively covers pns[0] and pns[1] (proving the original cut
+	//       spurious), and
+	//   (b) raises largestAcked to pns[10], leaving pns[5..7] as gaps with
+	//       Difference >= 3 — fresh reordering losses.
+	// With the fix, detectSpuriousLosses runs before detectLostPackets, so
+	// both OnSpuriousLoss calls must precede every fresh OnCongestionEvent.
+	ackTime2 := ackTime.Add(50 * time.Millisecond)
+	cong.EXPECT().MaybeExitSlowStart()
+	spur0 := cong.EXPECT().OnSpuriousLoss(pns[0])
+	spur1 := cong.EXPECT().OnSpuriousLoss(pns[1])
+	freshCut5 := cong.EXPECT().OnCongestionEvent(pns[5], protocol.ByteCount(1000), gomock.Any())
+	freshCut6 := cong.EXPECT().OnCongestionEvent(pns[6], protocol.ByteCount(1000), gomock.Any())
+	freshCut7 := cong.EXPECT().OnCongestionEvent(pns[7], protocol.ByteCount(1000), gomock.Any())
+	gomock.InOrder(spur0, freshCut5)
+	gomock.InOrder(spur0, freshCut6)
+	gomock.InOrder(spur0, freshCut7)
+	gomock.InOrder(spur1, freshCut5)
+	gomock.InOrder(spur1, freshCut6)
+	gomock.InOrder(spur1, freshCut7)
+	cong.EXPECT().OnPacketAcked(pns[2], protocol.ByteCount(1000), gomock.Any(), ackTime2)
+	cong.EXPECT().OnPacketAcked(pns[3], protocol.ByteCount(1000), gomock.Any(), ackTime2)
+	cong.EXPECT().OnPacketAcked(pns[8], protocol.ByteCount(1000), gomock.Any(), ackTime2)
+	cong.EXPECT().OnPacketAcked(pns[9], protocol.ByteCount(1000), gomock.Any(), ackTime2)
+	cong.EXPECT().OnPacketAcked(pns[10], protocol.ByteCount(1000), gomock.Any(), ackTime2)
+	_, err = sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: ackRanges(
+			pns[0], pns[1], pns[2], pns[3], pns[4],
+			pns[8], pns[9], pns[10],
+		)},
+		protocol.Encryption1RTT, ackTime2,
+	)
+	require.NoError(t, err)
+}
+
+// TestSentPacketHandlerSpuriousLossWhenAckOnlyCoversLostPackets verifies that
+// an ACK whose ranges cover ONLY previously-declared-lost packets (no
+// in-flight ones) still drives OnSpuriousLoss. Such an ACK produces an empty
+// ackedPackets list because declared-lost packets are no longer in
+// pnSpace.history; without the early-detect ordering, ReceivedAck would
+// return at the len(ackedPackets)==0 early return and never notify the
+// congestion controller of the undo.
+func TestSentPacketHandlerSpuriousLossWhenAckOnlyCoversLostPackets(t *testing.T) {
+	sph, cong := newMockedSPH(t)
+
+	var packets packetTracker
+	sendPacket := func(t *testing.T, ti monotime.Time) protocol.PacketNumber {
+		t.Helper()
+		pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+		cong.EXPECT().OnPacketSent(ti, gomock.Any(), pn, protocol.ByteCount(1000), true)
+		sph.SentPacket(ti, pn, protocol.InvalidPacketNumber, nil,
+			[]Frame{packets.NewPingFrame(pn)},
+			protocol.Encryption1RTT, protocol.ECNNon, 1000, false, false)
+		return pn
+	}
+
+	start := monotime.Now()
+	now := start
+	var pns []protocol.PacketNumber
+	for range 5 {
+		pns = append(pns, sendPacket(t, now))
+		now = now.Add(10 * time.Millisecond)
+	}
+
+	// First ACK covers pns[4] only; pns[0] and pns[1] are reordering-lost.
+	ackTime := start.Add(time.Second)
+	cong.EXPECT().MaybeExitSlowStart()
+	cong.EXPECT().OnCongestionEvent(pns[0], protocol.ByteCount(1000), gomock.Any())
+	cong.EXPECT().OnCongestionEvent(pns[1], protocol.ByteCount(1000), gomock.Any())
+	cong.EXPECT().OnPacketAcked(pns[4], protocol.ByteCount(1000), gomock.Any(), ackTime)
+	_, err := sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[4])}, protocol.Encryption1RTT, ackTime)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []protocol.PacketNumber{pns[0], pns[1]}, packets.Lost)
+
+	// Second ACK covers ONLY [pns[0], pns[1], pns[4]] — pns[4] was already
+	// acked in the first ACK (gone from history) and pns[0..1] were declared
+	// lost (gone from history). pns[2..3] are still in flight but the ACK
+	// leaves them in the gap. detectAndRemoveAckedPackets therefore returns
+	// an empty ackedPackets list — but OnSpuriousLoss for pns[0..1] still
+	// has to fire.
+	ackTime2 := ackTime.Add(50 * time.Millisecond)
+	cong.EXPECT().OnSpuriousLoss(pns[0])
+	cong.EXPECT().OnSpuriousLoss(pns[1])
+	_, err = sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: ackRanges(pns[0], pns[1], pns[4])},
+		protocol.Encryption1RTT, ackTime2,
+	)
+	require.NoError(t, err)
+	// gomock fails the test at cleanup if any additional unexpected mock
+	// call fired (e.g. MaybeExitSlowStart, OnPacketAcked, OnCongestionEvent).
+}
+
+// TestSentPacketHandlerSpuriousOnlyAckRunsPostAckCleanup verifies that an
+// ACK whose only effect is to confirm a previously-declared-lost packet as
+// spurious (detectAndRemoveAckedPackets surfaces nothing because the PN was
+// removed from history at loss-declaration time) still runs the post-ACK
+// cleanup — particularly the PTO backoff reset. Returning early on empty
+// ackedPackets would leave ptoCount stuck at whatever value the prior PTO
+// firings inflated it to, even though the path is healthy enough to deliver
+// a late ACK for an ack-eliciting packet (and the cwnd cut was already
+// undone via OnSpuriousLoss earlier in the same ReceivedAck call).
+func TestSentPacketHandlerSpuriousOnlyAckRunsPostAckCleanup(t *testing.T) {
+	sph, cong := newMockedSPH(t)
+
+	var packets packetTracker
+	sendPacket := func(t *testing.T, ti monotime.Time) protocol.PacketNumber {
+		t.Helper()
+		pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+		cong.EXPECT().OnPacketSent(ti, gomock.Any(), pn, protocol.ByteCount(1000), true)
+		sph.SentPacket(ti, pn, protocol.InvalidPacketNumber, nil,
+			[]Frame{packets.NewPingFrame(pn)},
+			protocol.Encryption1RTT, protocol.ECNNon, 1000, false, false)
+		return pn
+	}
+
+	start := monotime.Now()
+	now := start
+	var pns []protocol.PacketNumber
+	for range 5 {
+		pns = append(pns, sendPacket(t, now))
+		now = now.Add(10 * time.Millisecond)
+	}
+
+	// First ACK covers pns[4]: pns[0] and pns[1] are declared lost. This ACK
+	// also marks peerCompletedAddressValidation, which gates the post-ACK
+	// ptoCount reset on subsequent ACKs.
+	ackTime := start.Add(time.Second)
+	cong.EXPECT().MaybeExitSlowStart()
+	cong.EXPECT().OnCongestionEvent(pns[0], protocol.ByteCount(1000), gomock.Any())
+	cong.EXPECT().OnCongestionEvent(pns[1], protocol.ByteCount(1000), gomock.Any())
+	cong.EXPECT().OnPacketAcked(pns[4], protocol.ByteCount(1000), gomock.Any(), ackTime)
+	_, err := sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[4])}, protocol.Encryption1RTT, ackTime)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []protocol.PacketNumber{pns[0], pns[1]}, packets.Lost)
+
+	// Simulate PTO backoff accumulated from earlier probe timeouts. The
+	// spurious-only ACK below must clear this — any acknowledgment of an
+	// ack-eliciting packet (even a retroactive one) is forward progress that
+	// RFC 9002 §6.2.1 says resets the backoff factor.
+	sph.(*sentPacketHandler).ptoCount = 3
+
+	// Second ACK covers only pns[0] — already declared lost, gone from
+	// history, so detectAndRemoveAckedPackets returns empty. The early
+	// return would have skipped the ptoCount reset; the fix routes through
+	// the post-ACK cleanup because detectSpuriousLosses found something.
+	ackTime2 := ackTime.Add(50 * time.Millisecond)
+	cong.EXPECT().OnSpuriousLoss(pns[0])
+	_, err = sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: ackRanges(pns[0])},
+		protocol.Encryption1RTT, ackTime2,
+	)
+	require.NoError(t, err)
+	require.Zero(t, sph.(*sentPacketHandler).ptoCount,
+		"spurious-only ACK must reset PTO backoff via the post-ACK cleanup")
+}
+
+// TestSentPacketHandlerSpuriousLossOnReorderedAck verifies that an ACK
+// whose LargestAcked is BELOW the current pnSpace.largestAcked still drives
+// OnSpuriousLoss for ranges that retroactively cover previously-declared-
+// lost packets. This is the "reordered ACK at the sender" case: ACK A is
+// sent first, ACK B is sent later (and seen first), then A arrives. A's
+// LargestAcked is older than B's, but A's ranges may include declared-lost
+// packets that detectAndRemoveAckedPackets won't surface (those PNs are
+// gone from pnSpace.history). Gating detectSpuriousLosses on
+// largestAcked >= pnSpace.largestAcked would silently drop the undo for
+// every spurious-loss confirmation that arrives in such a reordered ACK.
+func TestSentPacketHandlerSpuriousLossOnReorderedAck(t *testing.T) {
+	sph, cong := newMockedSPH(t)
+
+	var packets packetTracker
+	sendPacket := func(t *testing.T, ti monotime.Time) protocol.PacketNumber {
+		t.Helper()
+		pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+		cong.EXPECT().OnPacketSent(ti, gomock.Any(), pn, protocol.ByteCount(1000), true)
+		sph.SentPacket(ti, pn, protocol.InvalidPacketNumber, nil,
+			[]Frame{packets.NewPingFrame(pn)},
+			protocol.Encryption1RTT, protocol.ECNNon, 1000, false, false)
+		return pn
+	}
+
+	start := monotime.Now()
+	now := start
+	var pns []protocol.PacketNumber
+	for range 5 {
+		pns = append(pns, sendPacket(t, now))
+		now = now.Add(10 * time.Millisecond)
+	}
+
+	// First ACK covers pns[4] only; pns[0] and pns[1] are declared lost via
+	// the reordering threshold.
+	ackTime := start.Add(time.Second)
+	cong.EXPECT().MaybeExitSlowStart()
+	cong.EXPECT().OnCongestionEvent(pns[0], protocol.ByteCount(1000), gomock.Any())
+	cong.EXPECT().OnCongestionEvent(pns[1], protocol.ByteCount(1000), gomock.Any())
+	cong.EXPECT().OnPacketAcked(pns[4], protocol.ByteCount(1000), gomock.Any(), ackTime)
+	_, err := sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[4])}, protocol.Encryption1RTT, ackTime)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []protocol.PacketNumber{pns[0], pns[1]}, packets.Lost)
+
+	// Reordered ACK arrives second: LargestAcked = pns[0] (well below the
+	// current pnSpace.largestAcked of pns[4]), with a range covering only
+	// pns[0]. detectAndRemoveAckedPackets will return empty (pns[0] is gone
+	// from history), but detectSpuriousLosses must still fire OnSpuriousLoss
+	// for pns[0]. pns[1] is in lostPackets too but isn't in this ACK's
+	// ranges, so it stays.
+	ackTime2 := ackTime.Add(50 * time.Millisecond)
+	cong.EXPECT().OnSpuriousLoss(pns[0])
+	_, err = sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: ackRanges(pns[0])},
+		protocol.Encryption1RTT, ackTime2,
+	)
+	require.NoError(t, err)
+}
+
+// TestSentPacketHandlerLostPacketTrackerCapacityEvictionAbandonsUndo verifies
+// that when detectLostPackets adds a counted loss while the lost-packet
+// tracker is at capacity, the evicted oldest entry drives
+// AbandonSpuriousLossUndo. The lossesInEpoch counter the controller bumped
+// for the evicted PN cannot be decremented by a future ACK (the entry is
+// gone), so leaving the snapshot in place would strand the undo above zero
+// and silently disable it for the current epoch.
+func TestSentPacketHandlerLostPacketTrackerCapacityEvictionAbandonsUndo(t *testing.T) {
+	sph, cong := newMockedSPH(t)
+	// Shrink the tracker so we can demonstrate eviction with only a few
+	// losses instead of >64.
+	sph.(*sentPacketHandler).lostPackets = *newLostPacketTracker(2)
+
+	var packets packetTracker
+	sendPacket := func(t *testing.T, ti monotime.Time) protocol.PacketNumber {
+		t.Helper()
+		pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+		cong.EXPECT().OnPacketSent(ti, gomock.Any(), pn, protocol.ByteCount(1000), true)
+		sph.SentPacket(ti, pn, protocol.InvalidPacketNumber, nil,
+			[]Frame{packets.NewPingFrame(pn)},
+			protocol.Encryption1RTT, protocol.ECNNon, 1000, false, false)
+		return pn
+	}
+
+	start := monotime.Now()
+	now := start
+	var pns []protocol.PacketNumber
+	for range 6 {
+		pns = append(pns, sendPacket(t, now))
+		now = now.Add(10 * time.Millisecond)
+	}
+
+	cong.EXPECT().MaybeExitSlowStart().AnyTimes()
+
+	// First ACK covers pns[3]: pns[0] is declared lost via reordering threshold
+	// (Difference(3, 0) = 3).
+	ackTime := start.Add(time.Second)
+	cong.EXPECT().OnCongestionEvent(pns[0], protocol.ByteCount(1000), gomock.Any())
+	cong.EXPECT().OnPacketAcked(pns[3], protocol.ByteCount(1000), gomock.Any(), ackTime)
+	_, err := sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[3])}, protocol.Encryption1RTT, ackTime)
+	require.NoError(t, err)
+
+	// Second ACK extends largest to pns[4]: pns[1] becomes lost. Tracker now
+	// holds [pns[0], pns[1]] — at capacity.
+	ackTime2 := ackTime.Add(10 * time.Millisecond)
+	cong.EXPECT().OnCongestionEvent(pns[1], protocol.ByteCount(1000), gomock.Any())
+	cong.EXPECT().OnPacketAcked(pns[4], protocol.ByteCount(1000), gomock.Any(), ackTime2)
+	_, err = sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[3], pns[4])}, protocol.Encryption1RTT, ackTime2)
+	require.NoError(t, err)
+
+	// Third ACK extends largest to pns[5]: pns[2] is declared lost. Add to
+	// the tracker overflows capacity, evicting pns[0] (the oldest and
+	// counted) — that must drive AbandonSpuriousLossUndo(pns[0]) so the
+	// controller doesn't keep counting it.
+	ackTime3 := ackTime2.Add(10 * time.Millisecond)
+	cong.EXPECT().OnCongestionEvent(pns[2], protocol.ByteCount(1000), gomock.Any())
+	cong.EXPECT().AbandonSpuriousLossUndo(pns[0])
+	cong.EXPECT().OnPacketAcked(pns[5], protocol.ByteCount(1000), gomock.Any(), ackTime3)
+	_, err = sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[3], pns[4], pns[5])}, protocol.Encryption1RTT, ackTime3)
+	require.NoError(t, err)
+}
+
+// TestSentPacketHandlerMigratedPathClearsLostPackets verifies that
+// MigratedPath drops the spurious-loss tracker alongside the fresh
+// congestion controller. Without this, a pre-migration entry with
+// CongestionInformed=true could later trigger OnSpuriousLoss on the new
+// cubicSender — whose snapshot starts from InvalidPacketNumber, so the
+// old (large positive) PN looks "in-epoch" against any new-path cut and
+// can undo it.
+func TestSentPacketHandlerMigratedPathClearsLostPackets(t *testing.T) {
+	sph := NewSentPacketHandler(
+		0,
+		1200,
+		utils.NewRTTStats(),
+		&utils.ConnectionStats{},
+		true,
+		false,
+		nil,
+		protocol.PerspectiveClient,
+		nil,
+		utils.DefaultLogger,
+	)
+
+	var packets packetTracker
+	sendPacket := func(t *testing.T, ti monotime.Time) protocol.PacketNumber {
+		t.Helper()
+		pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+		sph.SentPacket(ti, pn, protocol.InvalidPacketNumber, nil,
+			[]Frame{packets.NewPingFrame(pn)},
+			protocol.Encryption1RTT, protocol.ECNNon, 1000, false, false)
+		return pn
+	}
+
+	start := monotime.Now()
+	now := start
+	var pns []protocol.PacketNumber
+	for range 5 {
+		pns = append(pns, sendPacket(t, now))
+		now = now.Add(10 * time.Millisecond)
+	}
+
+	// First ACK covers pns[4] only — pns[0..1] are declared lost via the
+	// reordering threshold and added to lostPackets with
+	// CongestionInformed=true (ack-eliciting, non-MTU-probe).
+	_, err := sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: ackRanges(pns[4])},
+		protocol.Encryption1RTT,
+		start.Add(time.Second),
+	)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []protocol.PacketNumber{pns[0], pns[1]}, packets.Lost)
+	sphInternal := sph.(*sentPacketHandler)
+	require.NotZero(t, len(sphInternal.lostPackets.lostPackets),
+		"sanity: pre-migration losses should populate the spurious-loss tracker")
+
+	// Path migration. The spurious-loss tracker must be dropped — otherwise
+	// an ACK arriving on the new path that retroactively covers pns[0] or
+	// pns[1] would call OnSpuriousLoss on the freshly created cubicSender
+	// (whose largestSentAtLastCutback starts at InvalidPacketNumber) and
+	// could undo an unrelated new-path cut.
+	sph.MigratedPath(start.Add(2*time.Second), 1200)
+	require.Zero(t, len(sphInternal.lostPackets.lostPackets),
+		"MigratedPath must drop the pre-migration spurious-loss-tracker entries")
 }
 
 func BenchmarkSendAndAcknowledge(b *testing.B) {

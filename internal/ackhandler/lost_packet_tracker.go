@@ -11,6 +11,12 @@ import (
 type lostPacket struct {
 	PacketNumber protocol.PacketNumber
 	SendTime     monotime.Time
+	// CongestionInformed records whether the original loss declaration was
+	// reported to the congestion controller via OnCongestionEvent. Only such
+	// entries are eligible to drive OnSpuriousLoss; otherwise we'd decrement
+	// an epoch counter for a loss the controller never counted, and risk
+	// undoing an unrelated, genuine cutback.
+	CongestionInformed bool
 }
 
 type lostPacketTracker struct {
@@ -27,14 +33,22 @@ func newLostPacketTracker(maxLength int) *lostPacketTracker {
 	}
 }
 
-func (t *lostPacketTracker) Add(p protocol.PacketNumber, sendTime monotime.Time) {
+// Add appends a new entry. If the tracker is at capacity, the oldest entry
+// is evicted and returned via (evicted, true) so the caller can react —
+// notably, when a CongestionInformed eviction would otherwise strand the
+// congestion controller's per-epoch undo counter.
+func (t *lostPacketTracker) Add(p protocol.PacketNumber, sendTime monotime.Time, congestionInformed bool) (evicted lostPacket, didEvict bool) {
 	if len(t.lostPackets) == t.maxLength {
+		evicted = t.lostPackets[0]
+		didEvict = true
 		t.lostPackets = t.lostPackets[1:]
 	}
 	t.lostPackets = append(t.lostPackets, lostPacket{
-		PacketNumber: p,
-		SendTime:     sendTime,
+		PacketNumber:       p,
+		SendTime:           sendTime,
+		CongestionInformed: congestionInformed,
 	})
+	return evicted, didEvict
 }
 
 // Delete deletes a packet from the lost packet tracker.
@@ -46,22 +60,27 @@ func (t *lostPacketTracker) Delete(pn protocol.PacketNumber) {
 	})
 }
 
-func (t *lostPacketTracker) All() iter.Seq2[protocol.PacketNumber, monotime.Time] {
-	return func(yield func(protocol.PacketNumber, monotime.Time) bool) {
+func (t *lostPacketTracker) All() iter.Seq[lostPacket] {
+	return func(yield func(lostPacket) bool) {
 		for _, p := range t.lostPackets {
-			if !yield(p.PacketNumber, p.SendTime) {
+			if !yield(p) {
 				return
 			}
 		}
 	}
 }
 
-func (t *lostPacketTracker) DeleteBefore(ti monotime.Time) {
+// DeleteBefore prunes entries older than ti and returns them so the caller
+// can react to CongestionInformed evictions (the congestion controller's
+// per-epoch undo counter must be cleared for any in-epoch entry that ages
+// out without being confirmed spurious; otherwise the counter would be
+// stranded above zero and block the undo permanently).
+func (t *lostPacketTracker) DeleteBefore(ti monotime.Time) (evicted []lostPacket) {
 	if len(t.lostPackets) == 0 {
-		return
+		return nil
 	}
 	if !t.lostPackets[0].SendTime.Before(ti) {
-		return
+		return nil
 	}
 	var idx int
 	for ; idx < len(t.lostPackets); idx++ {
@@ -69,5 +88,7 @@ func (t *lostPacketTracker) DeleteBefore(ti monotime.Time) {
 			break
 		}
 	}
+	evicted = slices.Clone(t.lostPackets[:idx])
 	t.lostPackets = slices.Delete(t.lostPackets, 0, idx)
+	return evicted
 }

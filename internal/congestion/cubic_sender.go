@@ -59,6 +59,46 @@ type cubicSender struct {
 
 	lastState qlog.CongestionState
 	qlogger   qlogwriter.Recorder
+
+	// preCutback is the cwnd state captured immediately before the most
+	// recent loss-driven cutback. Used to undo the cutback if every
+	// declared loss in the cutback's epoch is later detected as spurious.
+	// nil once consumed or once a fresh cutback happens for a higher PN.
+	preCutback *cwndSnapshot
+
+	// lossesInEpoch counts the OnCongestionEvent calls within the current
+	// cutback's epoch (the first call cuts cwnd; subsequent calls in the
+	// same epoch are folded into a single loss event but still bump this
+	// counter). OnSpuriousLoss decrements it; the undo only fires when it
+	// reaches zero — i.e. every declared loss in the epoch was disproven.
+	// This guards against undoing a cut where some sibling loss was real,
+	// even when the trigger packet itself turns out to have been ACKed.
+	lossesInEpoch int
+}
+
+// cwndSnapshot is a saved cubicSender state, used for spurious-loss undo.
+type cwndSnapshot struct {
+	congestionWindow           protocol.ByteCount
+	slowStartThreshold         protocol.ByteCount
+	largestSentAtLastCutback   protocol.PacketNumber
+	lastCutbackExitedSlowstart bool
+	// numAckedPackets carries Reno's accumulated additive-increase progress
+	// (ACK credit toward the next CA cwnd increment). OnCongestionEvent
+	// zeros it on every cut, so we must snapshot it pre-cut to restore the
+	// credit when the cut turns out spurious.
+	numAckedPackets uint64
+	cubic           Cubic
+	// clamped records whether the cut left cwnd numerically unchanged
+	// (pre-cut cwnd was already at minCongestionWindow, so β*cwnd or the
+	// Cubic reduction was clamped back up to min). It disambiguates the
+	// two ways OnSpuriousLoss can see c.cwnd == s.congestionWindow:
+	//   - clamped == true:  the cut never reduced cwnd, so numAckedPackets
+	//     and the Cubic state were reset without any post-cut growth to
+	//     preserve. The undo *must* restore them.
+	//   - clamped == false: post-cut CA grew cwnd back to exactly the
+	//     pre-cut value via fresh ACKs. numAckedPackets and Cubic now hold
+	//     newer post-cut state that the undo must *not* overwrite.
+	clamped bool
 }
 
 var (
@@ -203,8 +243,26 @@ func (c *cubicSender) OnCongestionEvent(packetNumber protocol.PacketNumber, lost
 	// TCP NewReno (RFC6582) says that once a loss occurs, any losses in packets
 	// already sent should be treated as a single loss event, since it's expected.
 	if packetNumber <= c.largestSentAtLastCutback {
+		// Same loss epoch — no further cut, but track this loss for the
+		// spurious-loss undo counter so we don't wrongly undo when only
+		// the trigger turns out to be spurious while a sibling was real.
+		if c.preCutback != nil {
+			c.lossesInEpoch++
+		}
 		return
 	}
+	// Snapshot pre-cut state for possible spurious-loss undo. A fresh cutback
+	// supersedes any older snapshot — once we cut again, the prior cut's
+	// "what would things look like if we hadn't cut" is no longer reachable.
+	c.preCutback = &cwndSnapshot{
+		congestionWindow:           c.congestionWindow,
+		slowStartThreshold:         c.slowStartThreshold,
+		largestSentAtLastCutback:   c.largestSentAtLastCutback,
+		lastCutbackExitedSlowstart: c.lastCutbackExitedSlowstart,
+		numAckedPackets:            c.numAckedPackets,
+		cubic:                      *c.cubic,
+	}
+	c.lossesInEpoch = 1
 	c.lastCutbackExitedSlowstart = c.InSlowStart()
 	c.maybeQlogStateChange(qlog.CongestionStateRecovery)
 
@@ -216,11 +274,117 @@ func (c *cubicSender) OnCongestionEvent(packetNumber protocol.PacketNumber, lost
 	if minCwnd := c.minCongestionWindow(); c.congestionWindow < minCwnd {
 		c.congestionWindow = minCwnd
 	}
+	// Record whether the reduction was a no-op on cwnd (pre-cut already at
+	// min, so the β / Cubic reduction got clamped back up). OnSpuriousLoss
+	// uses this to distinguish the genuine "clamped cut" case — where
+	// numAckedPackets and Cubic were reset without any cwnd movement and
+	// the snapshot is the only place to recover them — from the "catch-up"
+	// case where post-cut CA grew cwnd back to exactly the pre-cut value
+	// and the live state now holds newer post-cut progress.
+	c.preCutback.clamped = c.congestionWindow == c.preCutback.congestionWindow
 	c.slowStartThreshold = c.congestionWindow
 	c.largestSentAtLastCutback = c.largestSentPacketNumber
 	// reset packet count from congestion avoidance mode. We start
 	// counting again when we're out of recovery.
 	c.numAckedPackets = 0
+}
+
+// OnSpuriousLoss undoes the cwnd reduction taken on the previous
+// OnCongestionEvent only when *every* declared loss in the current cutback's
+// epoch has been confirmed spurious. This avoids erasing a real congestion
+// response when only some packets in the epoch were reordering false-
+// positives and a sibling was a genuine loss.
+func (c *cubicSender) OnSpuriousLoss(packetNumber protocol.PacketNumber) {
+	s := c.preCutback
+	if s == nil {
+		return
+	}
+	// The current epoch covers (preCutback.largestSentAtLastCutback,
+	// c.largestSentAtLastCutback]. A spurious packet outside that range
+	// belongs to some earlier cut whose snapshot is gone, so can't be
+	// used to undo the current cut.
+	if packetNumber <= s.largestSentAtLastCutback {
+		return
+	}
+	if c.lossesInEpoch > 0 {
+		c.lossesInEpoch--
+	}
+	if c.lossesInEpoch > 0 {
+		// Other losses in this epoch are still unresolved. If any of
+		// them is genuine, the cut was deserved — wait for confirmation.
+		return
+	}
+	// Always restore the epoch markers: ssthresh, largestSentAtLastCutback,
+	// and the SS-exit flag. None of them accumulate value during post-cut
+	// CA growth — only OnCongestionEvent moves them — so restoring them
+	// never erases any post-cut work. Skipping them would leave the sender
+	// stuck in CA at the post-cut ssthresh in two pathological cases:
+	//   - Clamped cut: pre-cut cwnd was already at minCongestionWindow, so
+	//     OnCongestionEvent didn't reduce cwnd numerically but DID set
+	//     ssthresh to minCongestionWindow and bump largestSentAtLastCutback.
+	//     The cwnd-restore gate below would skip everything (c.cwnd ==
+	//     s.cwnd) and the spurious undo would have no observable effect.
+	//   - Catch-up: post-cut ACKs grew cwnd past the pre-cut value via CA.
+	//     The cwnd-restore gate skips the cwnd assignment (correct — we
+	//     don't want to rewind growth), but we still want ssthresh back so
+	//     subsequent growth is exponential SS, not the slow AIMD pace.
+	c.slowStartThreshold = s.slowStartThreshold
+	c.largestSentAtLastCutback = s.largestSentAtLastCutback
+	c.lastCutbackExitedSlowstart = s.lastCutbackExitedSlowstart
+
+	// Restore cwnd / Reno credit / Cubic state only when the live state
+	// doesn't already reflect post-cut growth we'd otherwise discard:
+	//   - c.cwnd < s.cwnd: post-cut CA hasn't caught up to the pre-cut
+	//     value yet, so the snapshot's numAckedPackets/Cubic are still
+	//     the most accurate pre-cut state.
+	//   - s.clamped && c.cwnd == s.cwnd: the cut was a no-op on cwnd
+	//     (pre-cut already at min), so the equality is "never moved"
+	//     not "moved down and grew back". numAckedPackets and Cubic
+	//     were reset by the cut without any post-cut activity to
+	//     preserve — the snapshot is the only place those values still
+	//     live. The cwnd assignment is a no-op here.
+	// The equality case for a non-clamped cut is deliberately excluded:
+	// it means post-cut CA grew cwnd back to exactly the pre-cut value
+	// (Reno cwnd advances in MSS-sized steps, so landing on the snapshot
+	// is plausible), and the live numAckedPackets / Cubic now carry
+	// genuine post-cut progress.
+	if c.congestionWindow < s.congestionWindow || (s.clamped && c.congestionWindow == s.congestionWindow) {
+		c.congestionWindow = s.congestionWindow
+		c.numAckedPackets = s.numAckedPackets
+		*c.cubic = s.cubic
+	}
+	c.preCutback = nil
+	if c.InSlowStart() {
+		c.maybeQlogStateChange(qlog.CongestionStateSlowStart)
+	} else {
+		c.maybeQlogStateChange(qlog.CongestionStateCongestionAvoidance)
+	}
+}
+
+// AbandonSpuriousLossUndo is called when a CongestionInformed entry leaves
+// the lost-packet tracker without going through detectSpuriousLosses —
+// either evicted on capacity in Add or aged out in DeleteBefore. The
+// lossesInEpoch counter was incremented when OnCongestionEvent reported
+// that loss; once the entry is gone, no future ACK can drive
+// OnSpuriousLoss for it, and the counter would never reach zero, leaving
+// the current epoch's undo permanently disabled. Dropping preCutback here
+// makes subsequent OnSpuriousLoss calls bail out at the nil check rather
+// than spinning on a counter that can never resolve, and lets the next
+// genuine cut start with a clean snapshot.
+//
+// PNs that predate the current epoch (snapshot.largestSentAtLastCutback)
+// belong to an older cutback whose snapshot is already gone, so dropping
+// the current snapshot for them would be incorrect — skip them.
+func (c *cubicSender) AbandonSpuriousLossUndo(packetNumber protocol.PacketNumber) {
+	s := c.preCutback
+	if s == nil {
+		return
+	}
+	if packetNumber <= s.largestSentAtLastCutback {
+		return
+	}
+	c.preCutback = nil
+	c.lossesInEpoch = 0
 }
 
 // Called when we receive an ack. Normal TCP tracks how many packets one ack
@@ -294,6 +458,11 @@ func (c *cubicSender) OnRetransmissionTimeout(packetsRetransmitted bool) {
 	c.cubic.Reset()
 	c.slowStartThreshold = c.congestionWindow / 2
 	c.congestionWindow = c.minCongestionWindow()
+	// Drop any pre-RTO spurious-loss snapshot. A later OnSpuriousLoss for
+	// a packet from the pre-RTO epoch would otherwise restore the
+	// pre-RTO cwnd/ssthresh, undoing the RTO reset.
+	c.preCutback = nil
+	c.lossesInEpoch = 0
 }
 
 // OnConnectionMigration is called when the connection is migrated (?)
@@ -307,6 +476,12 @@ func (c *cubicSender) OnConnectionMigration() {
 	c.numAckedPackets = 0
 	c.congestionWindow = c.initialCongestionWindow
 	c.slowStartThreshold = c.initialMaxCongestionWindow
+	// Drop any pre-migration spurious-loss snapshot. A later
+	// OnSpuriousLoss for a packet from the pre-migration epoch would
+	// otherwise restore the pre-migration cwnd/ssthresh, undoing the
+	// migration reset that put cwnd back at the initial window.
+	c.preCutback = nil
+	c.lossesInEpoch = 0
 }
 
 func (c *cubicSender) maybeQlogStateChange(new qlog.CongestionState) {
