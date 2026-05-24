@@ -3,7 +3,7 @@ package congestion
 import (
 	"time"
 
-	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/philwo/quic-go/internal/protocol"
 )
 
 // HyStart++ parameters per RFC 9406.

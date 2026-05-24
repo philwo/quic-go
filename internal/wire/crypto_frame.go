@@ -3,8 +3,8 @@ package wire
 import (
 	"io"
 
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/quicvarint"
+	"github.com/philwo/quic-go/internal/protocol"
+	"github.com/philwo/quic-go/quicvarint"
 )
 
 // A CryptoFrame is a CRYPTO frame

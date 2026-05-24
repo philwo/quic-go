@@ -28,7 +28,7 @@ linters:
         quicvarint:
           list-mode: strict
           files:
-            - '**/github.com/quic-go/quic-go/quicvarint/*'
+            - '**/github.com/philwo/quic-go/quicvarint/*'
             - '!$test'
           allow:
             - $gostd
@@ -51,7 +51,7 @@ linters:
           files:
             - '**/http3/**'
           deny:
-            - pkg: 'github.com/quic-go/quic-go/internal'
+            - pkg: 'github.com/philwo/quic-go/internal'
               desc: 'no dependency on quic-go/internal'
     misspell:
       ignore-rules:

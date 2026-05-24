@@ -1,8 +1,8 @@
 package flowcontrol
 
 import (
-	"github.com/quic-go/quic-go/internal/monotime"
-	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/philwo/quic-go/internal/monotime"
+	"github.com/philwo/quic-go/internal/protocol"
 )
 
 type flowController interface {

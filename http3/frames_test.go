@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3/qlog"
-	"github.com/quic-go/quic-go/qlogwriter"
-	"github.com/quic-go/quic-go/quicvarint"
-	"github.com/quic-go/quic-go/testutils/events"
+	"github.com/philwo/quic-go"
+	"github.com/philwo/quic-go/http3/qlog"
+	"github.com/philwo/quic-go/qlogwriter"
+	"github.com/philwo/quic-go/quicvarint"
+	"github.com/philwo/quic-go/testutils/events"
 
 	ossfuzzseeds "github.com/quic-go/go-ossfuzz-seeds"
 

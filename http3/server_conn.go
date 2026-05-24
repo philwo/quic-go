@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/quic-go/qpack"
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/qlogwriter"
+	"github.com/philwo/quic-go"
+	"github.com/philwo/quic-go/qlogwriter"
 )
 
 // RawServerConn is an HTTP/3 server connection.

@@ -25,12 +25,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/integrationtests/tools"
-	"github.com/quic-go/quic-go/internal/handshake"
-	"github.com/quic-go/quic-go/qlog"
-	"github.com/quic-go/quic-go/qlogwriter"
-	"github.com/quic-go/quic-go/testutils/events"
+	"github.com/philwo/quic-go"
+	"github.com/philwo/quic-go/integrationtests/tools"
+	"github.com/philwo/quic-go/internal/handshake"
+	"github.com/philwo/quic-go/qlog"
+	"github.com/philwo/quic-go/qlogwriter"
+	"github.com/philwo/quic-go/testutils/events"
 
 	"github.com/stretchr/testify/require"
 )

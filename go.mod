@@ -1,4 +1,4 @@
-module github.com/quic-go/quic-go
+module github.com/philwo/quic-go
 
 go 1.25.0
 

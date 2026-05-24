@@ -9,9 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/quic-go/quic-go/internal/ackhandler"
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/internal/wire"
+	"github.com/philwo/quic-go/internal/ackhandler"
+	"github.com/philwo/quic-go/internal/protocol"
+	"github.com/philwo/quic-go/internal/wire"
 )
 
 var (
