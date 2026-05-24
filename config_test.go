@@ -132,6 +132,8 @@ func configWithNonZeroNonFunctionFields(t *testing.T) *Config {
 			f.Set(reflect.ValueOf(int(17)))
 		case "LossDetectionTimeThreshold":
 			f.Set(reflect.ValueOf(float64(1.5)))
+		case "AckGapSettleDelay":
+			f.Set(reflect.ValueOf(2 * time.Millisecond))
 		default:
 			t.Fatalf("all fields must be accounted for, but saw unknown field %q", fn)
 		}

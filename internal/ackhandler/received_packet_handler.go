@@ -2,6 +2,7 @@ package ackhandler
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/quic-go/quic-go/internal/monotime"
 	"github.com/quic-go/quic-go/internal/protocol"
@@ -17,11 +18,11 @@ type ReceivedPacketHandler struct {
 	lowest1RTTPacket protocol.PacketNumber
 }
 
-func NewReceivedPacketHandler(logger utils.Logger) *ReceivedPacketHandler {
+func NewReceivedPacketHandler(logger utils.Logger, ackGapSettleDelay time.Duration) *ReceivedPacketHandler {
 	return &ReceivedPacketHandler{
 		initialPackets:   newReceivedPacketTracker(),
 		handshakePackets: newReceivedPacketTracker(),
-		appDataPackets:   *newAppDataReceivedPacketTracker(logger),
+		appDataPackets:   *newAppDataReceivedPacketTracker(logger, ackGapSettleDelay),
 		lowest1RTTPacket: protocol.InvalidPacketNumber,
 	}
 }

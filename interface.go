@@ -175,6 +175,17 @@ type Config struct {
 	// values (including the zero/"unset" value) and non-finite values
 	// (NaN, ±Inf) silently fall back to the default.
 	LossDetectionTimeThreshold float64
+	// AckGapSettleDelay delays the gap-revealing ACK at the receiver by up
+	// to this duration when a new missing-packet gap is first detected.
+	// RFC 9000 §13.2.1 recommends sending an immediate ACK on out-of-order
+	// receipt; on paths with bounded sub-RTT reordering (v4-in-v6 ISP
+	// tunnels, ECMP fan-outs), that immediate ACK reveals a gap that fills
+	// microseconds later and causes the sender to spuriously declare loss.
+	// Holding the ACK for a short settle window lets the gap fill before
+	// the sender sees it. Cost: real losses are detected by the peer one
+	// settle interval later. Defaults to 0 (RFC-compliant immediate ACK).
+	// Values up to a few ms are typically safe.
+	AckGapSettleDelay time.Duration
 	// InitialPacketSize is the initial size (and the lower limit) for packets sent.
 	// Under most circumstances, it is not necessary to manually set this value,
 	// since path MTU discovery quickly finds the path's MTU.

@@ -113,6 +113,7 @@ func populateConfig(config *Config) *Config {
 		KeepAlivePeriod:                  config.KeepAlivePeriod,
 		LossDetectionPacketThreshold:     config.LossDetectionPacketThreshold,
 		LossDetectionTimeThreshold:       config.LossDetectionTimeThreshold,
+		AckGapSettleDelay:                config.AckGapSettleDelay,
 		InitialStreamReceiveWindow:       initialStreamReceiveWindow,
 		MaxStreamReceiveWindow:           maxStreamReceiveWindow,
 		InitialConnectionReceiveWindow:   initialConnectionReceiveWindow,

@@ -88,8 +88,19 @@ type appDataReceivedPacketTracker struct {
 	largestObserved protocol.PacketNumber
 	ignoreBelow     protocol.PacketNumber
 
-	maxAckDelay time.Duration
-	ackQueued   bool // true if we need send a new ACK
+	maxAckDelay       time.Duration
+	ackGapSettleDelay time.Duration // 0 = disabled (RFC-compliant immediate ACK on out-of-order)
+	ackQueued         bool          // true if we need send a new ACK
+
+	// ackGapSettleUntil suppresses ACK sending until this time when a new
+	// missing-packet gap is first detected. If the gap fills before the
+	// timer fires, no gap-revealing ACK is sent.
+	ackGapSettleUntil monotime.Time
+	// ackGapSettleArmedFor is the highest-PN missing packet that the
+	// current settle window covers. Tracking this prevents an already-
+	// armed gap from re-arming on every subsequent packet arrival; only
+	// a newer (higher-PN) gap refreshes the window.
+	ackGapSettleArmedFor protocol.PacketNumber
 
 	ackElicitingPacketsReceivedSinceLastAck int
 	ackAlarm                                monotime.Time
@@ -97,10 +108,12 @@ type appDataReceivedPacketTracker struct {
 	logger utils.Logger
 }
 
-func newAppDataReceivedPacketTracker(logger utils.Logger) *appDataReceivedPacketTracker {
+func newAppDataReceivedPacketTracker(logger utils.Logger, ackGapSettleDelay time.Duration) *appDataReceivedPacketTracker {
 	h := &appDataReceivedPacketTracker{
 		receivedPacketTracker: *newReceivedPacketTracker(),
 		maxAckDelay:           protocol.MaxAckDelay,
+		ackGapSettleDelay:     ackGapSettleDelay,
+		ackGapSettleArmedFor:  protocol.InvalidPacketNumber,
 		logger:                logger,
 	}
 	return h
@@ -119,11 +132,34 @@ func (h *appDataReceivedPacketTracker) ReceivedPacket(pn protocol.PacketNumber, 
 	}
 	h.ackElicitingPacketsReceivedSinceLastAck++
 	isMissing := h.isMissing(pn)
-	if !h.ackQueued && h.shouldQueueACK(pn, ecn, isMissing) {
-		h.ackQueued = true
-		h.ackAlarm = 0 // cancel the ack alarm
+
+	// Track the gap-settle window independently of the rest of the queue
+	// logic so that gaps opening after ackQueued is already set still get
+	// their own settle protection. The new-vs-already-armed distinction
+	// matters: a single unfilled gap should arm once, not re-arm on every
+	// subsequent packet — otherwise the deadline drifts forward forever.
+	h.updateGapSettle(rcvTime)
+
+	queueReason := h.ackQueueReason(pn, ecn, isMissing)
+	if !h.ackQueued && queueReason != ackReasonNone {
+		if queueReason == ackReasonNewMissing && h.ackGapSettleDelay > 0 {
+			// The settle window was armed above; don't queue the ACK yet.
+			// GetAckFrame will refuse to ship anything until the window
+			// expires (or the gap fills and clears the suppression).
+		} else {
+			h.ackQueued = true
+			// Cancel the ack alarm, but keep the gap-settle wake-up if one
+			// is pending — GetAckFrame will refuse to send until it
+			// expires, and the connection still needs a timer to wake at
+			// the right moment.
+			if h.ackGapSettleUntil.IsZero() {
+				h.ackAlarm = 0
+			} else {
+				h.ackAlarm = h.ackGapSettleUntil
+			}
+		}
 	}
-	if !h.ackQueued {
+	if !h.ackQueued && h.ackAlarm.IsZero() {
 		// No ACK queued, but we'll need to acknowledge the packet after max_ack_delay.
 		h.ackAlarm = rcvTime.Add(h.maxAckDelay)
 		if h.logger.Debug() {
@@ -154,6 +190,55 @@ func (h *appDataReceivedPacketTracker) isMissing(p protocol.PacketNumber) bool {
 	return p < h.lastAck.LargestAcked() && !h.lastAck.AcksPacket(p)
 }
 
+// updateGapSettle arms, refreshes, or clears the gap-settle suppression
+// window. The window is keyed to the highest-PN currently-missing packet:
+//   - new highest missing PN > previously armed PN: arm/refresh, deadline =
+//     rcvTime + ackGapSettleDelay.
+//   - same as previously armed: do nothing (don't refresh — the gap has
+//     already had its share of the settle window).
+//   - no qualifying missing PN at all: clear the suppression.
+//
+// "Qualifying" mirrors hasNewMissingPackets: missing PN must be above
+// reorderingThreshold below largestObserved, and not already reported
+// missing in lastAck.
+func (h *appDataReceivedPacketTracker) updateGapSettle(rcvTime monotime.Time) {
+	if h.ackGapSettleDelay == 0 {
+		return
+	}
+	if h.lastAck == nil || h.largestObserved < reorderingThreshold {
+		return
+	}
+	highestMissing := h.packetHistory.HighestMissingUpTo(h.largestObserved - reorderingThreshold)
+	qualifies := highestMissing != protocol.InvalidPacketNumber &&
+		highestMissing >= h.lastAck.LargestAcked() &&
+		highestMissing > h.lastAck.LargestAcked()-reorderingThreshold
+	if !qualifies {
+		if !h.ackGapSettleUntil.IsZero() {
+			if h.logger.Debug() {
+				h.logger.Debugf("\tGap filled before settle window expired; clearing suppression.")
+			}
+			h.ackGapSettleUntil = 0
+			h.ackGapSettleArmedFor = protocol.InvalidPacketNumber
+		}
+		return
+	}
+	if highestMissing <= h.ackGapSettleArmedFor {
+		// already armed for this gap (or a higher one we've since seen);
+		// don't refresh — the existing deadline still bounds how long
+		// this gap can be hidden from the peer.
+		return
+	}
+	h.ackGapSettleArmedFor = highestMissing
+	h.ackGapSettleUntil = rcvTime.Add(h.ackGapSettleDelay)
+	if h.ackAlarm.IsZero() || h.ackGapSettleUntil.Before(h.ackAlarm) {
+		h.ackAlarm = h.ackGapSettleUntil
+	}
+	if h.logger.Debug() {
+		h.logger.Debugf("\tDeferring gap-revealing ACK (highest missing PN %d) for %s.",
+			highestMissing, h.ackGapSettleDelay)
+	}
+}
+
 func (h *appDataReceivedPacketTracker) hasNewMissingPackets() bool {
 	if h.lastAck == nil {
 		return false
@@ -172,7 +257,20 @@ func (h *appDataReceivedPacketTracker) hasNewMissingPackets() bool {
 	return highestMissing > h.lastAck.LargestAcked()-reorderingThreshold
 }
 
-func (h *appDataReceivedPacketTracker) shouldQueueACK(pn protocol.PacketNumber, ecn protocol.ECN, wasMissing bool) bool {
+// ackQueueReason explains why an ACK should be queued, or ackReasonNone if no
+// reason applies. The distinction matters because ackReasonNewMissing may be
+// deferred by the gap-settle window while the other reasons fire immediately.
+type ackQueueReason int
+
+const (
+	ackReasonNone ackQueueReason = iota
+	ackReasonWasMissing
+	ackReasonPacketsThreshold
+	ackReasonNewMissing
+	ackReasonECNCE
+)
+
+func (h *appDataReceivedPacketTracker) ackQueueReason(pn protocol.PacketNumber, ecn protocol.ECN, wasMissing bool) ackQueueReason {
 	// Send an ACK if this packet was reported missing in an ACK sent before.
 	// Ack decimation with reordering relies on the timer to send an ACK, but if
 	// missing packets we reported in the previous ACK, send an ACK immediately.
@@ -180,7 +278,7 @@ func (h *appDataReceivedPacketTracker) shouldQueueACK(pn protocol.PacketNumber, 
 		if h.logger.Debug() {
 			h.logger.Debugf("\tQueueing ACK because packet %d was missing before.", pn)
 		}
-		return true
+		return ackReasonWasMissing
 	}
 
 	// send an ACK every 2 ack-eliciting packets
@@ -188,24 +286,34 @@ func (h *appDataReceivedPacketTracker) shouldQueueACK(pn protocol.PacketNumber, 
 		if h.logger.Debug() {
 			h.logger.Debugf("\tQueueing ACK because packet %d packets were received after the last ACK (using initial threshold: %d).", h.ackElicitingPacketsReceivedSinceLastAck, packetsBeforeAck)
 		}
-		return true
+		return ackReasonPacketsThreshold
 	}
 
 	// queue an ACK if there are new missing packets to report
 	if h.hasNewMissingPackets() {
 		h.logger.Debugf("\tQueuing ACK because there's a new missing packet to report.")
-		return true
+		return ackReasonNewMissing
 	}
 
 	// queue an ACK if the packet was ECN-CE marked
 	if ecn == protocol.ECNCE {
 		h.logger.Debugf("\tQueuing ACK because the packet was ECN-CE marked.")
-		return true
+		return ackReasonECNCE
 	}
-	return false
+	return ackReasonNone
 }
 
 func (h *appDataReceivedPacketTracker) GetAckFrame(now monotime.Time, onlyIfQueued bool) *wire.AckFrame {
+	// Suppress ACK sending entirely while inside the gap-settle window —
+	// otherwise a packets-threshold or other trigger could leak the gap
+	// before it has had a chance to fill. The window auto-clears when
+	// the gap fills (in ReceivedPacket) or when this time passes.
+	if !h.ackGapSettleUntil.IsZero() && now.Before(h.ackGapSettleUntil) {
+		return nil
+	}
+	h.ackGapSettleUntil = 0
+	h.ackGapSettleArmedFor = protocol.InvalidPacketNumber
+
 	if onlyIfQueued && !h.ackQueued {
 		if h.ackAlarm.IsZero() || h.ackAlarm.After(now) {
 			return nil

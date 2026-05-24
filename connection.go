@@ -558,7 +558,7 @@ func (c *Conn) preSetup() {
 	c.lastPacketReceivedTime = now
 	c.creationTime = now
 
-	c.receivedPacketHandler = *ackhandler.NewReceivedPacketHandler(c.logger)
+	c.receivedPacketHandler = *ackhandler.NewReceivedPacketHandler(c.logger, c.config.AckGapSettleDelay)
 
 	c.datagramQueue = newDatagramQueue(c.scheduleSending, c.logger)
 	c.connState.Version = c.version
